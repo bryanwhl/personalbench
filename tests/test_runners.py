@@ -186,3 +186,12 @@ def test_codex_event_parser_preserves_unicode_line_separators():
     output, usage = _parse_codex(stdout)
     assert output == text
     assert usage["input_tokens"] == 1
+
+
+def test_nonstandard_billed_token_categories_leave_estimated_cost_unknown():
+    config = {
+        "prices": {"input_per_million": 1, "cached_input_per_million": 0.1, "output_per_million": 5}
+    }
+    for extra in ("cache_write_input_tokens", "cache_creation_input_tokens", "image_tokens"):
+        usage = {"input_tokens": 100, "output_tokens": 10, extra: 20}
+        assert token_cost(usage, config) == (None, "unknown")

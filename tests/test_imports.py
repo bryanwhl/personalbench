@@ -363,11 +363,19 @@ def test_unicode_line_separators_inside_json_strings_remain_one_record(tmp_path)
     records = [
         {
             "type": "response_item",
-            "payload": {"role": "user", "content": [{"type": "input_text", "text": text}]},
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": text}],
+            },
         },
         {
             "type": "response_item",
-            "payload": {"role": "assistant", "content": [{"type": "output_text", "text": "Done"}]},
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Done"}],
+            },
         },
     ]
     source = tmp_path / "unicode.jsonl"
