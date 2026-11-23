@@ -6,6 +6,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -32,7 +33,15 @@ def private_directory(path: Path) -> Path:
     path = Path(path).absolute()
     for ancestor in (path, *path.parents):
         if ancestor.is_symlink():
-            raise ValueError("Private artifact paths must not contain symlinks")
+            # macOS exposes its root-owned temporary directories through these aliases.
+            system_alias = (
+                sys.platform == "darwin"
+                and ancestor in {Path("/var"), Path("/tmp")}
+                and ancestor.lstat().st_uid == 0
+                and ancestor.resolve() == Path("/private") / ancestor.name
+            )
+            if not system_alias:
+                raise ValueError("Private artifact paths must not contain symlinks")
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
     return path
 

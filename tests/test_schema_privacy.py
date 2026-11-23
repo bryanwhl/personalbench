@@ -58,3 +58,10 @@ class SchemaPrivacyTests(unittest.TestCase):
             results = scan_paths(path)
             self.assertTrue(results)
             self.assertNotIn(synthetic, json.dumps(results))
+
+
+def test_platform_temporary_directory_is_usable_without_path_rewriting():
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "artifact.json"
+        write_private(path, "{}")
+        assert path.read_text() == "{}"

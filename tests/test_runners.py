@@ -170,3 +170,28 @@ class RunnerTests(unittest.TestCase):
             token_cost({"input_tokens": 1, "cached_input_tokens": 2, "output_tokens": 1}, config)[0]
         )
         self.assertIsNone(token_cost({}, config)[0])
+
+
+def test_codex_event_parser_preserves_unicode_line_separators():
+    from personalbench.runners import _parse_codex
+
+    text = "First\u2028second\u2029third\u0085fourth"
+    stdout = "\n".join(
+        json.dumps(event, ensure_ascii=False)
+        for event in [
+            {"type": "item.completed", "item": {"type": "agent_message", "text": text}},
+            {"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}},
+        ]
+    )
+    output, usage = _parse_codex(stdout)
+    assert output == text
+    assert usage["input_tokens"] == 1
+
+
+def test_nonstandard_billed_token_categories_leave_estimated_cost_unknown():
+    config = {
+        "prices": {"input_per_million": 1, "cached_input_per_million": 0.1, "output_per_million": 5}
+    }
+    for extra in ("cache_write_input_tokens", "cache_creation_input_tokens", "image_tokens"):
+        usage = {"input_tokens": 100, "output_tokens": 10, extra: 20}
+        assert token_cost(usage, config) == (None, "unknown")

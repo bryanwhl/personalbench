@@ -23,6 +23,18 @@ def token_cost(usage: dict, config: dict) -> tuple[float | None, str]:
     prices = config.get("prices")
     if not prices or not all(k in usage for k in ("input_tokens", "output_tokens")):
         return None, "unknown"
+    # Only estimate categories whose billing semantics are defined by this adapter.
+    included = {
+        "input_tokens",
+        "cached_input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "reasoning_output_tokens",
+    }
+    if any(
+        value and key.endswith("tokens") and key not in included for key, value in usage.items()
+    ):
+        return None, "unknown"
     try:
         inp = number(usage["input_tokens"], "input tokens")
         out = number(usage["output_tokens"], "output tokens")
@@ -95,7 +107,7 @@ def _environment(config: dict, directory: Path):
 
 def _parse_codex(stdout):
     outputs, usage, completed = [], {}, False
-    for line in stdout.splitlines():
+    for line in stdout.split("\n"):
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
@@ -283,6 +295,8 @@ def run_candidate(task, config, workspace: Path, *, allow_unsafe_local=False):
                         if raw
                         else {}
                     )
+                    if created:
+                        usage["cache_creation_input_tokens"] = created
                     cost = data.get("total_cost_usd", data.get("cost_usd"))
                     kind = "reported" if cost is not None else "unknown"
                 else:
