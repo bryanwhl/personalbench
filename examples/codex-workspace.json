@@ -1,0 +1,8 @@
+{
+  "name": "Codex coding baseline",
+  "harness": "codex",
+  "model": "REPLACE_WITH_ACCESSIBLE_MODEL_ID",
+  "timeout_seconds": 180,
+  "sandbox": "workspace-write",
+  "tools": "workspace"
+}

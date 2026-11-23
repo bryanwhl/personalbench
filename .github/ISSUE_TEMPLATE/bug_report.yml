@@ -1,0 +1,24 @@
+name: Bug report
+description: Report a reproducible problem using synthetic data.
+body:
+  - type: markdown
+    attributes:
+      value: Do not attach real sessions, credentials, or private task files. Use Security reporting for vulnerabilities.
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal synthetic reproduction
+      description: Include commands, a small safe task/configuration, and the relevant error.
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions and environment
+      description: Personalbench, Python, OS, harness version, and model identifier if applicable. Never include credentials.

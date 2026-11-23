@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "source_format": "normalized",
+  "messages": [
+    {
+      "role": "user",
+      "text": "Compare Cedar and Birch using the following preserved sources. Cedar: 8 USD/month, export API supported. Birch: 5 USD/month, no export API. I need an export API and a monthly cost at most 10 USD."
+    },
+    {
+      "role": "assistant",
+      "text": "Cedar satisfies both requirements: it costs 8 USD/month and supports an export API."
+    },
+    {
+      "role": "user",
+      "text": "Keep the recommendation concise and explain why Birch does not qualify."
+    },
+    {
+      "role": "assistant",
+      "text": "Choose Cedar: 8 USD/month with an export API. Birch is cheaper but lacks the required export API."
+    }
+  ],
+  "usage": {},
+  "duration_seconds": null,
+  "warnings": [
+    "Synthetic example; prices and services are fictional."
+  ]
+}

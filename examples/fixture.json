@@ -1,0 +1,16 @@
+{
+  "name": "Synthetic fixture \u2014 not a model evaluation",
+  "harness": "fixture",
+  "model": "synthetic-fixture-v1",
+  "responses": {
+    "stable-unique": "[3, 1, 2]",
+    "source-comparison": "{\"choice\": \"Cedar\", \"sources\": [\"S1\"]}",
+    "dependency-plan": "[\"migrate\", \"deploy\", \"verify\"]"
+  },
+  "usage": {
+    "input_tokens": 100,
+    "cached_input_tokens": 0,
+    "output_tokens": 30
+  },
+  "cost_usd": 0.001
+}

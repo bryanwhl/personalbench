@@ -1,0 +1,4 @@
+interface:
+  display_name: "Personalbench"
+  short_description: "Benchmark coding setups against your own workflows"
+  default_prompt: "Use $personalbench to turn my coding-agent work into a benchmark and evaluate a chosen setup."

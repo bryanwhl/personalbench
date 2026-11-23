@@ -1,0 +1,10 @@
+{
+  "name": "Claude Code text baseline",
+  "harness": "claude",
+  "model": "REPLACE_WITH_ACCESSIBLE_MODEL_ID",
+  "timeout_seconds": 120,
+  "tools": "none",
+  "env_allowlist": [
+    "ANTHROPIC_API_KEY"
+  ]
+}

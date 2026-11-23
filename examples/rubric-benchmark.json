@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "name": "Synthetic research and planning rubric",
+  "scoring": {
+    "success_threshold": 80,
+    "efficiency_weights": {
+      "time": 0.3333333333333333,
+      "prompts": 0.3333333333333333,
+      "cost": 0.3333333333333333
+    }
+  },
+  "tasks": [
+    {
+      "id": "research-tradeoffs",
+      "category": "research",
+      "brief": "Using the supplied source notes, recommend Cedar or Birch for a small team that requires an export API and a monthly price no greater than 10 USD. Explain the tradeoff and cite source IDs. Do not add facts absent from the notes.",
+      "inputs": {
+        "sources.txt": "S1: Cedar service costs 8 USD/month and provides an export API.\nS2: Birch service costs 5 USD/month and has no export API.\nS3: Maple service costs 15 USD/month and provides an export API.\nAll services and figures in these sources are fictional.\n"
+      },
+      "criteria": [
+        {
+          "id": "supported",
+          "description": "The answer chooses Cedar and correctly supports its price and export API with S1; it adds no unsupported product facts.",
+          "kind": "judge",
+          "value": null,
+          "target": "output",
+          "weight": 1,
+          "critical": true
+        },
+        {
+          "id": "tradeoff",
+          "description": "The answer explains that Birch costs less but fails the required export API constraint, citing S2.",
+          "kind": "judge",
+          "value": null,
+          "target": "output",
+          "weight": 1,
+          "critical": false
+        }
+      ],
+      "reference": {
+        "time_seconds": 60,
+        "user_prompts": 1,
+        "cost_usd": 0.05
+      },
+      "provenance": {
+        "source": "synthetic example"
+      }
+    },
+    {
+      "id": "migration-plan",
+      "category": "planning",
+      "brief": "Produce a short rollout plan for a database schema change and dependent API update. Deployment must follow migration. Include a preflight backup, verification after each change, and rollback conditions. Keep production data safe; do not propose deleting data to fix failures.",
+      "inputs": {},
+      "criteria": [
+        {
+          "id": "dependencies",
+          "description": "The plan performs a backup before migration, deploys the API after migration, and verifies each change.",
+          "kind": "judge",
+          "value": null,
+          "target": "output",
+          "weight": 1,
+          "critical": true
+        },
+        {
+          "id": "rollback",
+          "description": "The plan gives explicit stop/rollback conditions and preserves production data rather than deleting it.",
+          "kind": "judge",
+          "value": null,
+          "target": "output",
+          "weight": 1,
+          "critical": true
+        }
+      ],
+      "reference": {
+        "time_seconds": 60,
+        "user_prompts": 1,
+        "cost_usd": 0.05
+      },
+      "provenance": {
+        "source": "synthetic example"
+      }
+    }
+  ]
+}

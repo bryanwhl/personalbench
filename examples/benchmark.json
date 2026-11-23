@@ -1,0 +1,104 @@
+{
+  "schema_version": 1,
+  "name": "Synthetic workflow demo",
+  "scoring": {
+    "success_threshold": 80,
+    "efficiency_weights": {
+      "time": 0.3333333333333333,
+      "prompts": 0.3333333333333333,
+      "cost": 0.3333333333333333
+    }
+  },
+  "tasks": [
+    {
+      "id": "stable-unique",
+      "category": "coding",
+      "brief": "Return only a JSON array containing the unique integers in [3, 1, 3, 2, 1], preserving first-occurrence order.",
+      "inputs": {},
+      "criteria": [
+        {
+          "id": "correct-sequence",
+          "description": "Remove duplicates while preserving first-occurrence order.",
+          "kind": "json",
+          "value": [
+            3,
+            1,
+            2
+          ],
+          "target": "output",
+          "weight": 1,
+          "critical": true
+        }
+      ],
+      "reference": {
+        "time_seconds": 60,
+        "user_prompts": 1,
+        "cost_usd": 0.05
+      },
+      "provenance": {
+        "source": "synthetic example"
+      }
+    },
+    {
+      "id": "source-comparison",
+      "category": "research",
+      "brief": "Using only sources.txt, choose the service that satisfies BOTH an export API and a monthly price at most 10 USD. Return only JSON with keys choice and sources; sources must be an array of the source IDs supporting your choice.",
+      "inputs": {
+        "sources.txt": "S1: Cedar service costs 8 USD/month and provides an export API.\nS2: Birch service costs 5 USD/month and has no export API.\nS3: Maple service costs 15 USD/month and provides an export API.\nAll services and figures in these sources are fictional.\n"
+      },
+      "criteria": [
+        {
+          "id": "supported-choice",
+          "description": "Select Cedar using the supplied source.",
+          "kind": "json",
+          "value": {
+            "choice": "Cedar",
+            "sources": [
+              "S1"
+            ]
+          },
+          "target": "output",
+          "weight": 1,
+          "critical": true
+        }
+      ],
+      "reference": {
+        "time_seconds": 60,
+        "user_prompts": 1,
+        "cost_usd": 0.05
+      },
+      "provenance": {
+        "source": "synthetic example"
+      }
+    },
+    {
+      "id": "dependency-plan",
+      "category": "planning",
+      "brief": "Plan three steps: migrate the database, deploy the API, verify production health. The API depends on the migration, and health verification depends on deployment. Return only a JSON array with these exact step IDs in dependency order: verify, migrate, deploy.",
+      "inputs": {},
+      "criteria": [
+        {
+          "id": "dependency-order",
+          "description": "Order the steps according to their prerequisites.",
+          "kind": "json",
+          "value": [
+            "migrate",
+            "deploy",
+            "verify"
+          ],
+          "target": "output",
+          "weight": 1,
+          "critical": true
+        }
+      ],
+      "reference": {
+        "time_seconds": 60,
+        "user_prompts": 1,
+        "cost_usd": 0.05
+      },
+      "provenance": {
+        "source": "synthetic example"
+      }
+    }
+  ]
+}

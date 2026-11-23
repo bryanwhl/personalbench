@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "name": "Synthetic coding behavior check",
+  "scoring": {
+    "success_threshold": 80,
+    "efficiency_weights": {
+      "time": 0.3333333333333333,
+      "prompts": 0.3333333333333333,
+      "cost": 0.3333333333333333
+    }
+  },
+  "tasks": [
+    {
+      "id": "fix-stable-unique",
+      "category": "coding",
+      "brief": "Fix stable_unique(values) in dedupe.py. It receives a list of integers and must return each distinct integer once, in first-occurrence order. Handle empty lists and negative integers. Do not mutate the input list.",
+      "inputs": {
+        "dedupe.py": "def stable_unique(values):\n    return sorted(set(values))\n"
+      },
+      "criteria": [
+        {
+          "id": "behavior",
+          "description": "Pass behavior checks for stable ordering and input preservation.",
+          "kind": "command",
+          "value": [
+            "python3",
+            "check.py"
+          ],
+          "tests": {
+            "check.py": "import importlib.util\nimport os\nfrom pathlib import Path\n\npath = Path(os.environ[\"PERSONALBENCH_WORKSPACE\"]) / \"dedupe.py\"\nspec = importlib.util.spec_from_file_location(\"candidate_dedupe\", path)\nmodule = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(module)\nfor source, expected in [([], []), ([3, 1, 3, 2, 1], [3, 1, 2]), ([0, 0, -1, 0], [0, -1])]:\n    before = source.copy()\n    assert module.stable_unique(source) == expected\n    assert source == before, \"Do not mutate the input list\"\nprint(\"Stable order, duplicates, empty input, negatives, and input preservation passed\")\n"
+          },
+          "timeout_seconds": 10,
+          "weight": 1,
+          "critical": true
+        }
+      ],
+      "reference": {
+        "time_seconds": 120,
+        "user_prompts": 1,
+        "cost_usd": 0.1
+      },
+      "provenance": {
+        "source": "synthetic example"
+      }
+    }
+  ]
+}

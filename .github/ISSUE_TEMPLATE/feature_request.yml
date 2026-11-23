@@ -1,0 +1,18 @@
+name: Workflow or integration request
+description: Explain a personal workflow Personalbench should support.
+body:
+  - type: textarea
+    id: workflow
+    attributes:
+      label: Which decision or workflow would this help?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior and tradeoffs
+      description: Use synthetic examples. Mention any new data access, provider costs, or execution permissions.
+  - type: textarea
+    id: validation
+    attributes:
+      label: How could we verify it works?
