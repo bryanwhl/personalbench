@@ -356,3 +356,22 @@ def test_empty_normalized_inputs_do_not_establish_ready_code_state():
         {"messages": [{"role": "user", "text": "Fix the parser"}], "inputs": {}}
     )["tasks"][0]
     assert task["readiness"] == "incomplete"
+
+
+def test_unicode_line_separators_inside_json_strings_remain_one_record(tmp_path):
+    text = "A paragraph\u2028another paragraph\u2029next\u0085last"
+    records = [
+        {
+            "type": "response_item",
+            "payload": {"role": "user", "content": [{"type": "input_text", "text": text}]},
+        },
+        {
+            "type": "response_item",
+            "payload": {"role": "assistant", "content": [{"type": "output_text", "text": "Done"}]},
+        },
+    ]
+    source = tmp_path / "unicode.jsonl"
+    source.write_text("\n".join(json.dumps(record, ensure_ascii=False) for record in records))
+    session = import_session(source)
+    assert len(session["messages"]) == 2
+    assert session["messages"][0]["text"] == text

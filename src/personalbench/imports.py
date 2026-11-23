@@ -129,7 +129,7 @@ def import_session(path: Path, format: str = "auto") -> dict:
         records = decoded["messages"]
     else:
         records = []
-        for line_number, line in enumerate(text.splitlines(), 1):
+        for line_number, line in enumerate(text.split("\n"), 1):
             if not line.strip():
                 continue
             try:

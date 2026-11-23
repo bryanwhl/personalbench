@@ -95,7 +95,7 @@ def _environment(config: dict, directory: Path):
 
 def _parse_codex(stdout):
     outputs, usage, completed = [], {}, False
-    for line in stdout.splitlines():
+    for line in stdout.split("\n"):
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
