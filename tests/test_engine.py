@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from threading import Lock
 from unittest.mock import patch
 
 from personalbench.engine import evaluate
@@ -49,6 +50,22 @@ def fixture(ids=("a",)):
         "responses": {tid: "done" for tid in ids},
         "cost_usd": 0.6,
     }
+
+
+class ManualClock:
+    """Advance evaluation time at defined phase boundaries, independent of CI load."""
+
+    def __init__(self):
+        self.value = 100.0
+        self.lock = Lock()
+
+    def __call__(self):
+        with self.lock:
+            return self.value
+
+    def advance(self, seconds):
+        with self.lock:
+            self.value += seconds
 
 
 class EngineTests(unittest.TestCase):
@@ -262,9 +279,9 @@ class BudgetRegressionTests(unittest.TestCase):
 class ParallelEngineTests(unittest.TestCase):
     def test_workers_overlap_checkpoint_completions_and_keep_manifest_order(self):
         import threading
-        import time
 
         barrier = threading.Barrier(2)
+        b_checkpoint = threading.Event()
         lock = threading.Lock()
         active = 0
         maximum = 0
@@ -273,6 +290,8 @@ class ParallelEngineTests(unittest.TestCase):
 
         def checkpoint(path, value):
             snapshots.append([row["task_id"] for row in value["trials"]])
+            if "b" in snapshots[-1]:
+                b_checkpoint.set()
             save_json(path, value)
 
         def runner(task, config, workspace, **kwargs):
@@ -283,8 +302,8 @@ class ParallelEngineTests(unittest.TestCase):
             try:
                 if task["id"] in ("a", "b"):
                     barrier.wait(timeout=2)
-                if task["id"] == "a":
-                    time.sleep(0.05)
+                if task["id"] == "a" and not b_checkpoint.wait(timeout=5):
+                    raise AssertionError("Completed b was not checkpointed while a was pending")
                 return run_candidate(task, config, workspace, **kwargs)
             finally:
                 with lock:
@@ -676,14 +695,33 @@ class ParallelEngineTests(unittest.TestCase):
         self.assertEqual(len(result["trials"]), 2)
 
     def test_shortened_final_attempt_reports_batch_budget_without_false_failure(self):
+        clock = ManualClock()
         config = {
             "name": "Slow synthetic",
             "harness": "command",
             "model": "synthetic",
             "timeout_seconds": 10,
-            "command": [sys.executable, "-c", "import time; time.sleep(10)"],
+            "command": [sys.executable, "-c", "unused synthetic command"],
         }
-        with tempfile.TemporaryDirectory() as directory:
+
+        def timeout(task, bounded, workspace, **kwargs):
+            self.assertAlmostEqual(bounded["timeout_seconds"], 0.2)
+            clock.advance(bounded["timeout_seconds"] + 0.01)
+            return {
+                "status": "budget_exceeded",
+                "output": "",
+                "duration_seconds": 0.21,
+                "user_prompts": 1,
+                "usage": {},
+                "cost_usd": None,
+                "error": "Synthetic timeout",
+            }
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch("personalbench.engine.time.monotonic", clock),
+            patch("personalbench.engine.run_candidate", side_effect=timeout) as invoked,
+        ):
             result = evaluate(
                 benchmark(),
                 config,
@@ -691,36 +729,55 @@ class ParallelEngineTests(unittest.TestCase):
                 allow_unsafe_local=True,
                 max_total_seconds=0.2,
             )
+        self.assertEqual(invoked.call_count, 1)
         self.assertEqual(result["run_status"], "budget_stopped")
         self.assertEqual(result["trials"][0]["status"], "batch_budget_exceeded")
         self.assertIsNone(result["summary"]["success_pct"])
 
     def test_explicit_resume_retries_only_batch_truncation_and_keeps_overhead(self):
+        clock = ManualClock()
         config = {
             "name": "Synthetic resumable process",
             "harness": "command",
             "model": "synthetic",
             "timeout_seconds": 10,
-            "command": [
-                sys.executable,
-                "-c",
-                'import time,json;time.sleep(0.3);print(json.dumps({"output":"done","usage":{},"cost_usd":0.1}))',
-            ],
+            "command": [sys.executable, "-c", "unused synthetic command"],
         }
-        with tempfile.TemporaryDirectory() as directory:
+
+        def attempt(task, bounded, workspace, **kwargs):
+            limited = bounded["timeout_seconds"] < 0.3
+            duration = bounded["timeout_seconds"] + 0.01 if limited else 0.3
+            clock.advance(duration)
+            return {
+                "status": "budget_exceeded" if limited else "completed",
+                "output": "" if limited else "done",
+                "duration_seconds": duration,
+                "user_prompts": 1,
+                "usage": {},
+                "cost_usd": None if limited else 0.1,
+                "cost_kind": "unknown" if limited else "synthetic",
+                "error": None,
+            }
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch("personalbench.engine.time.monotonic", clock),
+        ):
             output = Path(directory) / "run"
-            first = evaluate(
-                benchmark(), config, output, allow_unsafe_local=True, max_total_seconds=0.2
-            )
-            self.assertEqual(first["trials"][0]["status"], "batch_budget_exceeded")
-            second = evaluate(
-                benchmark(),
-                config,
-                output,
-                allow_unsafe_local=True,
-                max_total_seconds=2,
-                resume=True,
-            )
+            with patch("personalbench.engine.run_candidate", side_effect=attempt) as invoked:
+                first = evaluate(
+                    benchmark(), config, output, allow_unsafe_local=True, max_total_seconds=0.2
+                )
+                self.assertEqual(first["trials"][0]["status"], "batch_budget_exceeded")
+                second = evaluate(
+                    benchmark(),
+                    config,
+                    output,
+                    allow_unsafe_local=True,
+                    max_total_seconds=2,
+                    resume=True,
+                )
+            self.assertEqual(invoked.call_count, 2)
             self.assertEqual(second["run_status"], "complete")
             self.assertEqual(second["summary"]["success_pct"], 100)
             self.assertEqual(len(second["trials"]), 1)
@@ -732,7 +789,7 @@ class ParallelEngineTests(unittest.TestCase):
             with patch(
                 "personalbench.engine.run_candidate",
                 side_effect=AssertionError("Duplicate completed candidate"),
-            ):
+            ) as replay:
                 evaluate(
                     benchmark(),
                     config,
@@ -741,17 +798,19 @@ class ParallelEngineTests(unittest.TestCase):
                     max_total_seconds=2,
                     resume=True,
                 )
+            self.assertEqual(replay.call_count, 0)
             # A full declared task timeout remains a scored failure, never a retry target.
             failed = Path(directory) / "full-timeout"
             short = dict(config, timeout_seconds=0.1)
-            result = evaluate(
-                benchmark(), short, failed, allow_unsafe_local=True, max_total_seconds=2
-            )
+            with patch("personalbench.engine.run_candidate", side_effect=attempt):
+                result = evaluate(
+                    benchmark(), short, failed, allow_unsafe_local=True, max_total_seconds=2
+                )
             self.assertEqual(result["trials"][0]["status"], "budget_exceeded")
             with patch(
                 "personalbench.engine.run_candidate",
                 side_effect=AssertionError("Retried full task timeout"),
-            ):
+            ) as retry:
                 resumed = evaluate(
                     benchmark(),
                     short,
@@ -760,18 +819,18 @@ class ParallelEngineTests(unittest.TestCase):
                     max_total_seconds=3,
                     resume=True,
                 )
+            self.assertEqual(retry.call_count, 0)
             self.assertEqual(resumed["summary"]["success_pct"], 0)
             self.assertEqual(resumed["retry_history"], [])
 
     def test_grading_budget_extension_reuses_candidate_and_preserves_judge_spend(self):
-        import time
-
+        clock = ManualClock()
         bench = benchmark()
         bench["tasks"][0]["criteria"][0]["kind"] = "judge"
 
         def slow(config, *, calls, **kwargs):
             def assess(prompt):
-                time.sleep(0.25)
+                clock.advance(0.25)
                 calls.append({"status": "completed", "cost_usd": 0.1})
                 return '{"scores":[{"id":"check","score":1,"evidence":"done"}]}'
 
@@ -784,7 +843,10 @@ class ParallelEngineTests(unittest.TestCase):
 
             return assess
 
-        with tempfile.TemporaryDirectory() as directory:
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch("personalbench.engine.time.monotonic", clock),
+        ):
             output = Path(directory) / "run"
             with patch("personalbench.engine.model_callback", side_effect=slow):
                 first = evaluate(
