@@ -8,6 +8,8 @@ A criterion returns a score between 0 and 1. Output quality is the weighted mean
 
 A task succeeds when its quality reaches the benchmark's `success_threshold` and every critical criterion passes. The default threshold is 80%. Critical criteria are appropriate for requirements whose violation invalidates the result, such as fabricating a required source or ignoring a prohibition.
 
+Compiled history benchmarks add a versioned, critical validity criterion. Missing a core deliverable, materially fabricating facts, or claiming required work without evidence fails this gate, even when the other quality scores exceed 80%. Minor presentation issues remain ordinary quality deductions. The gate evaluates only requirements already present in the brief and preserved inputs; it does not require the historical answer.
+
 Tasks are aggregated equally, so ten assertions in one task do not outweigh another goal with two assertions. Repeated attempts are summarized within each task before suite aggregation. The report retains the number of distinct tasks and attempts.
 
 Missing grading evidence does not become a failure or a pass. An incomplete run has explicit coverage and unavailable headline metrics where a complete score cannot be supported. Observed metrics are labeled separately; a setup cannot improve its headline by leaving hard tasks unscored.
@@ -47,7 +49,7 @@ Repeated successful attempts use median resource measurements. Failed scored att
 
 Keep the benchmark, criteria, references, weights, and judge configuration fixed. Reports record benchmark and scoring identities. Changing any of those creates a different scoring context.
 
-Eligibility is checked per metric. Complete quality scores can be compared even when token costs make efficiency unavailable.
+Eligibility is checked per metric. Complete quality scores can be compared even when token costs make efficiency unavailable. When a frozen benchmark includes incomplete or unsupported historical goals, quality and success can also compare the identical prepared-ready subset, provided every ready goal is fully graded in every report. The comparison explicitly labels its N/M scope. Missing candidate or judge evidence on any ready goal still blocks comparison; dropping difficult scored goals cannot improve a setup. Worker-count changes are disclosed because concurrency can affect latency.
 
 Recorded work and fresh runs are separate baseline types. Historical work may include extra user help and later clarifications; fresh runs receive the consolidated brief at the start. Reports do not represent the two as a controlled comparison.
 

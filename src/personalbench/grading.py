@@ -14,6 +14,8 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
+from .runners import check_cancellation
+
 
 def _number(value: object) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
@@ -310,9 +312,13 @@ def _command(
         reader = threading.Thread(target=drain, daemon=True)
         reader.start()
         try:
-            code = process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            raise ValueError("Command grader exceeded its time limit")
+            command_deadline = time.monotonic() + timeout
+            while process.poll() is None:
+                check_cancellation()
+                if time.monotonic() >= command_deadline:
+                    raise ValueError("Command grader exceeded its time limit")
+                time.sleep(0.05)
+            code = process.returncode
         finally:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
@@ -350,6 +356,7 @@ def _regex_matches(pattern: str, text: str, deadline: float | None = None) -> bo
 
 
 def _check_deadline(deadline: float | None) -> float:
+    check_cancellation()
     if deadline is None:
         return math.inf
     if not _number(deadline):

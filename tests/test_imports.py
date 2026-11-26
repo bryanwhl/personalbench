@@ -411,3 +411,45 @@ def test_unicode_line_separators_inside_json_strings_remain_one_record(tmp_path)
     session = import_session(source)
     assert len(session["messages"]) == 2
     assert session["messages"][0]["text"] == text
+
+
+def test_strict_preparation_cannot_silently_drop_user_requests():
+    session = {
+        "messages": [
+            {"role": "user", "text": "Explain stacks"},
+            {"role": "user", "text": "Explain queues"},
+        ]
+    }
+    compiled = {
+        "tasks": [
+            {
+                "id": "stack",
+                "brief": "Explain stacks",
+                "requires_starting_state": False,
+                "source_message_indices": [0],
+                "criteria": [{"id": "ok", "description": "Accurate explanation"}],
+            }
+        ]
+    }
+    with pytest.raises(ValueError, match="unaccounted"):
+        build_benchmark(session, compiler=lambda _: json.dumps(compiled), strict=True)
+    compiled["exclusions"] = [{"source_message_indices": [1], "reason": ""}]
+    with pytest.raises(ValueError, match="concrete reason"):
+        build_benchmark(session, compiler=lambda _: json.dumps(compiled), strict=True)
+
+
+def test_strict_preparation_supports_audited_non_work_without_fake_tasks():
+    result = build_benchmark(
+        {"messages": [{"role": "user", "text": "Reply exactly ACCESS_OK"}]},
+        compiler=lambda _: json.dumps(
+            {
+                "tasks": [],
+                "exclusions": [
+                    {"source_message_indices": [0], "reason": "Harness model-access probe"}
+                ],
+            }
+        ),
+        strict=True,
+    )
+    assert result["tasks"] == []
+    assert result["preparation_exclusions"]

@@ -39,13 +39,32 @@ def render_report(report: dict) -> str:
     scope_notice = (
         f'<p class="notice">{_escape(report["scope_note"])}</p>' if report.get("scope_note") else ""
     )
-    cards = "".join(
-        f'<div class="metric"><span>{label}</span><strong>{_percent(summary.get(key))}</strong></div>'
-        for key, label in (
-            ("output_quality_pct", "Output quality"),
-            ("success_pct", "Success"),
-            ("efficiency_pct", "Efficiency"),
+    cards = []
+    for key, label in (
+        ("output_quality_pct", "Output quality"),
+        ("success_pct", "Success"),
+        ("efficiency_pct", "Efficiency"),
+    ):
+        value = summary.get(key)
+        observed_key = (
+            "observed_quality_pct" if key == "output_quality_pct" else "observed_success_pct"
         )
+        if value is None and key != "efficiency_pct" and summary.get(observed_key) is not None:
+            value = summary[observed_key]
+            label = "Graded task " + ("quality" if key == "output_quality_pct" else "success")
+        cards.append(
+            f'<div class="metric"><span>{label}</span><strong>{_percent(value)}</strong></div>'
+        )
+    cards = "".join(cards)
+    definitions = report.get("task_manifest", [])
+    titles = (
+        {
+            task.get("id"): str(task.get("brief", "")).split("\n", 1)[0][:140]
+            for task in definitions
+            if isinstance(task, dict)
+        }
+        if isinstance(definitions, list)
+        else {}
     )
     coverage = summary.get("coverage", {})
     observed_note = ""
@@ -87,7 +106,7 @@ def render_report(report: dict) -> str:
             + "".join(
                 f"<td>{value}</td>"
                 for value in (
-                    _escape(task.get("task_id", "")),
+                    _escape(titles.get(task.get("task_id")) or task.get("task_id", "")),
                     _escape(task.get("category", "")),
                     _percent(task.get("output_quality_pct")),
                     _percent(task.get("success_pct")),

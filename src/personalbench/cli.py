@@ -6,6 +6,7 @@ import argparse
 import json
 import shutil
 import sys
+import time
 from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,9 +17,11 @@ from .engine import evaluate, model_callback
 from .history import build_history, discover_sessions, parse_as_of
 from .imports import build_benchmark, import_session
 from .privacy import DEFAULT_HOME, read_json, scan_paths, write_json, write_private
+from .recovery import extract_evidence
 from .report import render_report
 from .schema import validate_benchmark
 from .scoring import compare_reports
+from .workflow import _preparation_identity, evaluate_history
 
 
 def _destination(value: str | None, default: str) -> Path:
@@ -55,17 +58,29 @@ def _history_options(parser):
         "--session-root", action="append", help="Explicit JSONL directory; repeatable"
     )
     parser.add_argument(
+        "--exclude-session-id",
+        action="append",
+        default=[],
+        help="Exclude a chat and its descendants",
+    )
+    parser.add_argument(
         "--exclude-session", action="append", default=[], help="Exclude a session path"
     )
 
 
-def _discover(args):
+def _excluded_ids(args):
+    return sorted(set(args.exclude_session_id))
+
+
+def _discover(args, snapshot_dir=None):
     return discover_sessions(
         days=args.days,
         as_of=parse_as_of(args.as_of),
         source=args.source,
         roots=[Path(p) for p in args.session_root] if args.session_root else None,
         exclude=[Path(p) for p in args.exclude_session],
+        exclude_session_ids=_excluded_ids(args),
+        snapshot_dir=snapshot_dir,
     )
 
 
@@ -86,6 +101,29 @@ def parser():
         "--compiler", help="Optional model configuration for autonomous goal compilation"
     )
     build.add_argument("--allow-unsafe-local", action="store_true")
+    build.add_argument("--resume", action="store_true")
+    build.add_argument("--workers", type=int, default=3)
+    build.add_argument("--max-preparation-seconds", type=float, default=1800)
+    flow = sub.add_parser("evaluate", help="Freeze, prepare, recover and evaluate the past 60 days")
+    _history_options(flow)
+    _model_options(flow)
+    flow.add_argument("--config", required=True)
+    flow.add_argument(
+        "--compiler", help="Compiler config; defaults to candidate model with tools disabled"
+    )
+    flow.add_argument("--output")
+    flow.add_argument("--resume", action="store_true")
+    flow.add_argument(
+        "--refresh-preparation",
+        action="store_true",
+        help="Reaudit frozen inputs after fixes; preserve older benchmark/run revisions",
+    )
+    flow.add_argument("--workers", type=int, default=3)
+    flow.add_argument("--preparation-workers", type=int, default=3)
+    flow.add_argument("--max-preparation-seconds", type=float, default=1800)
+    flow.add_argument("--max-total-seconds", type=float, default=1800)
+    flow.add_argument("--stop-after-cost-usd", type=float)
+
     val = sub.add_parser("validate", help="Validate a benchmark without running models")
     val.add_argument("benchmark")
     for name in ("run", "grade-recorded"):
@@ -95,6 +133,7 @@ def parser():
         run.add_argument("benchmark")
         run.add_argument("--output")
         run.add_argument("--resume", action="store_true")
+        run.add_argument("--workers", type=int, default=1)
         run.add_argument("--max-total-seconds", type=float, default=1800)
         run.add_argument(
             "--stop-after-cost-usd",
@@ -151,6 +190,53 @@ def main(argv=None):
                     "warnings": session.get("warnings", []),
                 }
             )
+        elif args.action == "evaluate":
+            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S-%fZ")
+            output = _destination(args.output, f"evaluations/{stamp}")
+            result = evaluate_history(
+                output,
+                read_json(Path(args.config)),
+                compiler_config=read_json(Path(args.compiler)) if args.compiler else None,
+                judge_config=read_json(Path(args.judge)) if args.judge else None,
+                days=args.days,
+                as_of=args.as_of,
+                source=args.source,
+                roots=[Path(p) for p in args.session_root] if args.session_root else None,
+                exclude=[Path(p) for p in args.exclude_session],
+                exclude_session_ids=_excluded_ids(args),
+                workers=args.workers,
+                preparation_workers=args.preparation_workers,
+                max_preparation_seconds=args.max_preparation_seconds,
+                max_total_seconds=args.max_total_seconds,
+                stop_after_cost_usd=args.stop_after_cost_usd,
+                resume=args.resume,
+                refresh_preparation=args.refresh_preparation,
+                allow_unsafe_local=args.allow_unsafe_local,
+                progress=lambda event: print(json.dumps(event), file=sys.stderr),
+            )
+            report = result.get("report")
+            workflow = result["workflow"]
+            summary = report["summary"] if report else {}
+            _json(
+                {
+                    "stage": workflow["stage"],
+                    "report": workflow.get("report"),
+                    "sources": workflow.get("source_status", {}),
+                    "goals": workflow.get("goal_readiness", {}),
+                    "success_pct": summary.get("success_pct"),
+                    "output_quality_pct": summary.get("output_quality_pct"),
+                    "efficiency_pct": summary.get("efficiency_pct"),
+                    "observed_success_pct": summary.get("observed_success_pct"),
+                    "observed_quality_pct": summary.get("observed_quality_pct"),
+                    "coverage": {
+                        key: value
+                        for key, value in summary.get("coverage", {}).items()
+                        if key != "eligible_task_ids"
+                    },
+                }
+            )
+            if not report or workflow.get("stage") != "complete":
+                return 2
         elif args.action == "build":
             calls = []
             compiler = (
@@ -158,6 +244,7 @@ def main(argv=None):
                     read_json(Path(args.compiler)),
                     allow_unsafe_local=args.allow_unsafe_local,
                     calls=calls,
+                    deadline=time.monotonic() + args.max_preparation_seconds,
                 )
                 if args.compiler
                 else None
@@ -165,11 +252,23 @@ def main(argv=None):
             output = _destination(args.output, "benchmark.json")
             if args.session:
                 session = import_session(Path(args.session).expanduser())
+                raw_path = Path(args.session).expanduser()
+                if raw_path.name.endswith((".jsonl", ".jsonl.zst")):
+                    session["evidence"] = extract_evidence(raw_path)
                 benchmark = build_benchmark(session, name=args.name, compiler=compiler)
             else:
-                inventory = _discover(args)
                 inventory_path = output.with_suffix(".inventory.json")
+                inventory = (
+                    read_json(inventory_path)
+                    if args.resume and inventory_path.exists()
+                    else _discover(args, output.parent / (output.stem + ".sources"))
+                )
                 write_json(inventory_path, inventory)
+
+                def prepare_session(session, path):
+                    session["evidence"] = extract_evidence(path)
+                    session["history_window"] = {k: inventory[k] for k in ("since", "as_of")}
+                    return session
 
                 def checkpoint(entry):
                     write_json(inventory_path, inventory)
@@ -186,6 +285,12 @@ def main(argv=None):
                     compiler=compiler,
                     progress=checkpoint,
                     artifact_dir=output.parent / (output.stem + ".sessions"),
+                    resume=args.resume,
+                    workers=args.workers,
+                    prepare_session=prepare_session,
+                    compiler_identity=_preparation_identity(read_json(Path(args.compiler)))
+                    if args.compiler
+                    else None,
                 )
             write_json(output, benchmark)
             if calls:
@@ -231,6 +336,7 @@ def main(argv=None):
                 repeats=getattr(args, "repeats", 1),
                 baseline_type="fresh" if args.action == "run" else "recorded",
                 resume=args.resume,
+                workers=args.workers,
                 allow_unsafe_local=args.allow_unsafe_local,
                 max_total_seconds=args.max_total_seconds,
                 stop_after_cost_usd=args.stop_after_cost_usd,
@@ -242,11 +348,19 @@ def main(argv=None):
                     "success_pct": report["summary"]["success_pct"],
                     "output_quality_pct": report["summary"]["output_quality_pct"],
                     "efficiency_pct": report["summary"]["efficiency_pct"],
+                    "observed_success_pct": report["summary"].get("observed_success_pct"),
+                    "observed_quality_pct": report["summary"].get("observed_quality_pct"),
                     "coverage": report["summary"]["coverage"],
                 }
             )
-            if report["summary"]["coverage"]["complete_tasks"] < len(
-                read_json(Path(args.benchmark))["tasks"]
+            rows = {row["task_id"]: row for row in report["summary"]["tasks"]}
+            required = {
+                task["id"]
+                for task in report["task_manifest"]
+                if args.action == "grade-recorded" or task.get("readiness") in {None, "ready"}
+            }
+            if report["run_status"] != "complete" or any(
+                not rows.get(tid, {}).get("complete", False) for tid in required
             ):
                 return 2
         elif args.action == "compare":
@@ -309,7 +423,8 @@ def main(argv=None):
                     "version": __version__,
                     "python": sys.version.split()[0],
                     "executables": {
-                        name: bool(shutil.which(name)) for name in ("codex", "claude", "git")
+                        name: bool(shutil.which(name))
+                        for name in ("codex", "claude", "git", "zstd")
                     },
                     "private_data_home": str(DEFAULT_HOME),
                     "native_execution": "Requires --allow-unsafe-local for trusted tasks",

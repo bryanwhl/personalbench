@@ -157,3 +157,107 @@ class ScoringTests(unittest.TestCase):
         benchmark["scoring"]["efficiency_weights"]["time"] = float("nan")
         with self.assertRaises(ValueError):
             summarize(benchmark, [])
+
+
+class PreparedSubsetComparisonTests(unittest.TestCase):
+    def report(self, qualities=(100, 50), successes=(True, False)):
+        tasks = [task("a"), task("b"), dict(task("c"), readiness="unsupported")]
+        trials = [
+            trial(tid, quality=quality, success=success)
+            for tid, quality, success in zip(("a", "b"), qualities, successes, strict=True)
+        ]
+        trials.append(
+            {"task_id": "c", "status": "preparation_error", "grading": {"status": "unscorable"}}
+        )
+        return {
+            "benchmark_hash": "fixed-benchmark",
+            "scoring_hash": "fixed-scoring",
+            "baseline_type": "fresh",
+            "configuration": {"model": "synthetic"},
+            "task_manifest": [
+                {"id": "a"},
+                {"id": "b", "readiness": "ready"},
+                {"id": "c", "readiness": "unsupported"},
+            ],
+            "summary": summarize({"tasks": tasks, "repeats": 1}, trials),
+        }
+
+    def test_same_frozen_preparation_gaps_allow_labeled_quality_success_comparison(self):
+        first = self.report()
+        second = self.report((90, 80), (True, True))
+        result = compare_reports([first, second])
+        self.assertTrue(result["comparable"])
+        self.assertEqual(result["comparable_metrics"], ["output_quality_pct", "success_pct"])
+        self.assertEqual(result["deltas"][0]["output_quality_pct"], 10)
+        self.assertEqual(result["deltas"][0]["success_pct"], 50)
+        self.assertIsNone(result["deltas"][0]["efficiency_pct"])
+        self.assertEqual(result["metric_scope"]["success_pct"]["task_ids"], ["a", "b"])
+        self.assertEqual(
+            result["metric_scope"]["success_pct"]["excluded_readiness"], {"c": "unsupported"}
+        )
+        self.assertIn("Fixed prepared subset 2/3; not a whole-history score", result["warnings"][0])
+        self.assertIsNone(first["summary"]["success_pct"])
+
+    def test_missing_ready_candidate_or_judge_evidence_never_becomes_a_subset(self):
+        first = self.report()
+        for status in ("infrastructure_error", "completed"):
+            broken = self.report()
+            unscored = trial(
+                "b",
+                status=status,
+                grading={"status": "grading_error", "quality_pct": None, "success": None},
+            )
+            broken["summary"] = summarize(
+                {"tasks": [task("a"), task("b"), task("c")], "repeats": 1},
+                [
+                    trial("a"),
+                    unscored,
+                    {
+                        "task_id": "c",
+                        "status": "preparation_error",
+                        "grading": {"status": "unscorable"},
+                    },
+                ],
+            )
+            with self.subTest(status=status):
+                self.assertFalse(compare_reports([first, broken])["comparable"])
+                self.assertFalse(compare_reports([broken, copy.deepcopy(broken)])["comparable"])
+
+    def test_different_frozen_manifests_or_eligible_sets_are_rejected(self):
+        first = self.report()
+        for change in (
+            "readiness",
+            "eligible",
+            "partial_excluded",
+            "repeat_gap",
+            "observed_average",
+        ):
+            second = self.report()
+            if change == "readiness":
+                second["task_manifest"][2]["readiness"] = "incomplete"
+            elif change == "eligible":
+                second["summary"]["coverage"]["eligible_task_ids"]["output_quality_pct"] = ["a"]
+            elif change == "partial_excluded":
+                second["summary"]["tasks"][2].update(
+                    scored_repeats=1, observed_quality_pct=100, observed_success_pct=100
+                )
+            elif change == "repeat_gap":
+                second["summary"]["tasks"][1]["scored_repeats"] = 0
+            else:
+                second["summary"]["observed_quality_pct"] = 99
+            with self.subTest(change=change):
+                result = compare_reports([first, second])
+                self.assertNotIn("output_quality_pct", result["comparable_metrics"])
+                self.assertIsNone(
+                    result["deltas"][0]["output_quality_pct"] if result["deltas"] else None
+                )
+
+    def test_worker_changes_are_disclosed_without_invalidating_fixed_scores(self):
+        first = self.report()
+        second = self.report()
+        first["execution"] = {"workers": 1}
+        second["execution"] = {"workers": 3}
+        result = compare_reports([first, second])
+        self.assertTrue(result["comparable"])
+        self.assertEqual(result["changed_execution_fields"], ["workers"])
+        self.assertIn("Worker concurrency can affect latency", " ".join(result["caveats"]))

@@ -194,6 +194,99 @@ def summarize(benchmark: dict, trials: list[dict]) -> dict:
     }
 
 
+def _prepared_subset_scope(reports: list[dict], eligible_sets: list, metric: str) -> dict | None:
+    """Authorize only the same frozen preparation subset, never an observed winner subset."""
+    manifests = []
+    for report in reports:
+        manifest = report.get("task_manifest")
+        if isinstance(manifest, dict):
+            if any(not isinstance(value, dict) for value in manifest.values()):
+                return None
+            manifest = [{**value, "id": tid} for tid, value in manifest.items()]
+        if not isinstance(manifest, list) or not manifest:
+            return None
+        states = {}
+        for task in manifest:
+            if not isinstance(task, dict):
+                return None
+            tid = task.get("id")
+            state = task.get("readiness", "ready")
+            # Engine manifests represent an absent task.readiness as null.
+            state = "ready" if state is None else state
+            if (
+                not isinstance(tid, str)
+                or not tid
+                or tid in states
+                or not isinstance(state, str)
+                or state not in {"ready", "incomplete", "unsupported"}
+            ):
+                return None
+            states[tid] = state
+        coverage = report.get("summary", {}).get("coverage", {})
+        if coverage.get("total_tasks") != len(states):
+            return None
+        manifests.append(states)
+    if any(states != manifests[0] for states in manifests[1:]):
+        return None
+    states = manifests[0]
+    ready = sorted(tid for tid, state in states.items() if state == "ready")
+    excluded = sorted(set(states) - set(ready))
+    if not ready or not excluded or any(ids != ready for ids in eligible_sets):
+        return None
+    observed_metric = {
+        "output_quality_pct": "observed_quality_pct",
+        "success_pct": "observed_success_pct",
+    }.get(metric)
+    if observed_metric is None:
+        return None
+    for report in reports:
+        summary = report.get("summary", {})
+        rows = summary.get("tasks")
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            return None
+        if any(not isinstance(row.get("task_id"), str) for row in rows):
+            return None
+        by_id = {row.get("task_id"): row for row in rows}
+        if len(by_id) != len(rows) or set(by_id) != set(states):
+            return None
+        for tid in ready:
+            row = by_id[tid]
+            expected = row.get("expected_repeats")
+            if (
+                not isinstance(expected, int)
+                or isinstance(expected, bool)
+                or expected < 1
+                or row.get("complete") is not True
+                or row.get("attempted_repeats") != expected
+                or row.get("scored_repeats") != expected
+                or row.get("unknown_repeats", 0) != 0
+                or not _valid(row.get(metric), maximum=100)
+            ):
+                return None
+        # Otherwise a partial excluded goal could leak into observed averages.
+        if any(
+            by_id[tid].get("scored_repeats", 0) != 0
+            or by_id[tid].get("observed_quality_pct") is not None
+            or by_id[tid].get("observed_success_pct") is not None
+            for tid in excluded
+        ):
+            return None
+        if not _valid(summary.get(observed_metric), maximum=100):
+            return None
+        if not math.isclose(
+            summary[observed_metric], mean(by_id[tid][metric] for tid in ready), abs_tol=1e-9
+        ):
+            return None
+    return {
+        "kind": "fixed_prepared_subset",
+        "task_ids": ready,
+        "evaluated_tasks": len(ready),
+        "total_tasks": len(states),
+        "excluded_task_ids": excluded,
+        "excluded_readiness": {tid: states[tid] for tid in excluded},
+    }
+
+
 def compare_reports(reports: list[dict]) -> dict:
     """Compare each metric separately without letting missing cost hide quality."""
     metrics = ("output_quality_pct", "success_pct", "efficiency_pct")
@@ -203,6 +296,8 @@ def compare_reports(reports: list[dict]) -> dict:
             "reasons": ["At least two reports are required"],
             "comparable_metrics": [],
             "metric_reasons": {},
+            "metric_scope": {},
+            "warnings": [],
             "deltas": [],
         }
     first = reports[0]
@@ -219,33 +314,66 @@ def compare_reports(reports: list[dict]) -> dict:
         reasons.append("Recorded and fresh runs are different baseline types")
     metric_reasons: dict[str, list[str]] = {}
     comparable_metrics = []
+    metric_scope = {}
+    metric_values = {}
     for metric in metrics:
         failures = []
-        eligible_sets = [
+        raw_sets = [
             report.get("summary", {}).get("coverage", {}).get("eligible_task_ids", {}).get(metric)
             for report in reports
         ]
-        if not eligible_sets[0] or any(
-            not isinstance(ids, list) or sorted(ids) != sorted(eligible_sets[0])
-            for ids in eligible_sets
-        ):
+        eligible_sets = [
+            sorted(ids)
+            if isinstance(ids, list) and all(isinstance(tid, str) for tid in ids)
+            else None
+            for ids in raw_sets
+        ]
+        same_sets = (
+            bool(eligible_sets[0])
+            and all(
+                ids == eligible_sets[0] and len(set(ids)) == len(ids)
+                for ids in eligible_sets
+                if ids is not None
+            )
+            and all(ids is not None for ids in eligible_sets)
+        )
+        if not same_sets:
             failures.append("Different or missing eligible task sets")
-        if any(
-            not _valid(report.get("summary", {}).get(metric), maximum=100) for report in reports
-        ):
+        whole = same_sets and all(
+            isinstance(report.get("summary", {}).get("coverage", {}).get("total_tasks"), int)
+            and len(eligible_sets[0]) == report["summary"]["coverage"]["total_tasks"]
+            for report in reports
+        )
+        scope = None
+        values = [report.get("summary", {}).get(metric) for report in reports]
+        if whole:
+            scope = {
+                "kind": "whole_benchmark",
+                "task_ids": eligible_sets[0],
+                "evaluated_tasks": len(eligible_sets[0]),
+                "total_tasks": len(eligible_sets[0]),
+            }
+        elif same_sets and metric != "efficiency_pct":
+            scope = _prepared_subset_scope(reports, eligible_sets, metric)
+            if scope is not None:
+                observed = (
+                    "observed_quality_pct"
+                    if metric == "output_quality_pct"
+                    else "observed_success_pct"
+                )
+                values = [report["summary"][observed] for report in reports]
+        if scope is None:
+            failures.append(
+                "Every benchmark task or the identical fully graded prepared-ready subset "
+                "must be eligible for this metric"
+            )
+        if any(not _valid(value, maximum=100) for value in values):
             failures.append("Incomplete measurement or grading evidence")
-        for report in reports:
-            coverage = report.get("summary", {}).get("coverage", {})
-            if (
-                not isinstance(coverage.get("total_tasks"), int)
-                or not eligible_sets[0]
-                or len(eligible_sets[0]) != coverage["total_tasks"]
-            ):
-                failures.append("Every benchmark task must be eligible for this metric")
-                break
         metric_reasons[metric] = reasons + failures
         if not metric_reasons[metric]:
             comparable_metrics.append(metric)
+            metric_scope[metric] = scope
+            metric_values[metric] = values
     configurations = [report.get("configuration", {}) for report in reports]
     changed_fields = sorted(
         {
@@ -258,8 +386,32 @@ def compare_reports(reports: list[dict]) -> dict:
     caveats = [
         "Results compare complete setups. Changes in tools, instructions, budgets, and models can all affect outcomes."
     ]
+    executions = [report.get("execution", {}) for report in reports]
+    changed_execution_fields = sorted(
+        {
+            key
+            for execution in executions
+            for key in execution
+            if any(execution.get(key) != executions[0].get(key) for execution in executions)
+        }
+    )
+    if changed_execution_fields:
+        caveats.append(
+            "Execution scheduling differs: "
+            + ", ".join(changed_execution_fields)
+            + ". Worker concurrency can affect latency and efficiency."
+        )
     if baseline_types == {"recorded"}:
         caveats.append("Recorded results describe historical observations, not controlled reruns.")
+    scope_warnings = sorted(
+        {
+            f"Fixed prepared subset {scope['evaluated_tasks']}/{scope['total_tasks']}; "
+            "not a whole-history score. Preparation-incomplete and unsupported goals remain excluded."
+            for scope in metric_scope.values()
+            if scope["kind"] == "fixed_prepared_subset"
+        }
+    )
+    caveats.extend(scope_warnings)
     deltas = []
     if comparable_metrics:
         for index, report in enumerate(reports[1:], start=1):
@@ -268,7 +420,7 @@ def compare_reports(reports: list[dict]) -> dict:
                     "report_index": index,
                     "baseline_index": 0,
                     **{
-                        metric: report["summary"][metric] - first["summary"][metric]
+                        metric: metric_values[metric][index] - metric_values[metric][0]
                         if metric in comparable_metrics
                         else None
                         for metric in metrics
@@ -280,7 +432,10 @@ def compare_reports(reports: list[dict]) -> dict:
         "reasons": reasons,
         "comparable_metrics": comparable_metrics,
         "metric_reasons": metric_reasons,
+        "metric_scope": metric_scope,
+        "warnings": scope_warnings,
         "deltas": deltas,
         "changed_configuration_fields": changed_fields,
+        "changed_execution_fields": changed_execution_fields,
         "caveats": caveats,
     }

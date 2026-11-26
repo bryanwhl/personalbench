@@ -11,7 +11,11 @@ Use the installed `personalbench` CLI for validation, execution, scoring, and lo
 
 For an unqualified request to run Personalbench, discover and distill the past **60 days** of available local Codex and Claude sessions. Do not ask the user to pick one session or substitute the synthetic demo. Honor an explicitly narrower session, source, date range, or task selection.
 
-Use `personalbench sessions` to inventory the window, then `personalbench build --compiler /path/to/compiler.json --output .personalbench/history/benchmark.json --allow-unsafe-local`. Both commands default to 60 days and all supported sources. Use `--days`, `--as-of` (a timezone-aware ISO instant), `--source`, and `--session-root` to freeze or override discovery. Exclude the active evaluation chat and its forks using `--exclude-session` so the benchmark does not evaluate its own preparation. Retain the corpus inventory beside the benchmark.
+Use `personalbench evaluate --config /path/to/candidate.json --output .personalbench/history --allow-unsafe-local` for the complete default workflow. It freezes discovery, recovers source evidence, compiles goals, runs bounded parallel attempts, and creates one report without private wrapper scripts. The compiler and judge default to the explicitly chosen candidate model with tools disabled; set separate configurations when requested. Inspect `--help` for worker and time budgets.
+
+Resume the same output with `--resume`. After a preparation fix, use `--resume --refresh-preparation` to revalidate frozen source inputs and cached goal compilation. Changed benchmarks create a new revision and run directory; prior reports stay intact. Do not rerun completed candidates merely to retry an interrupted assessment, or retry scored task failures until they pass.
+
+`--days`, `--as-of`, `--source`, and `--session-root` override the default corpus. Current Codex and internal agent chats are automatically excluded; use `--exclude-session-id` or `--exclude-session` for additional known exclusions. `sessions` inventories without printing content. Use `build` separately when only preparation is wanted, and keep its inventory and frozen sources with the benchmark.
 
 Distill independent goals across the whole window, preserving genuine clarifications. In resumed chats, retain earlier messages as context but exclude independent goals with no user request or clarification in the window. Collapse repeated goals and fork prefixes when requirements and starting inputs are equivalent; keep materially different constraints and source snapshots distinct. Keep every source accounted for: included, duplicate, excluded, import/preparation error, or missing evidence. Do not silently sample a convenient session or present the runnable subset as full-history coverage. Without a compiler, a corpus build is an incomplete preparation draft, not a finished evaluation.
 
@@ -29,7 +33,7 @@ Before declaring inputs missing, inspect the selected raw session logs, includin
 
 Recover only genuine starting inputs. Do not substitute today's files for absent historical state. Mark tasks incomplete when required files, sources, or tools are unavailable. For new work, use `capture start` before inputs change and `capture finish` afterward. Choose explicit capture or bounded `watch` according to the workflow; do not silently install persistent background collection.
 
-Prefer outcome checks to matching the historical tool sequence. Use executable assertions for verifiable behavior and rubric criteria for open-ended quality. A rubric should name the relevant requirements, evidence, and critical failures. The original answer is evidence, not an unquestionable answer key. Keep reference solutions and hidden tests outside candidate inputs.
+Prefer outcome checks to matching the historical tool sequence. Use executable assertions for verifiable behavior and rubric criteria for open-ended quality. A rubric should name the relevant requirements, evidence, and critical failures. Compiled history tasks include a critical validity gate for missing core outcomes, material fabrication, and unsupported completion claims. Keep minor style issues in ordinary quality criteria. The original answer is evidence, not an unquestionable answer key. Keep reference solutions and hidden tests outside candidate inputs.
 
 ## Evaluate and compare
 
@@ -38,6 +42,10 @@ Keep benchmark tasks, inputs, criteria, thresholds, efficiency references, weigh
 Use `run` for fresh execution or `grade-recorded` for historical work. Start with one attempt per ready goal across the corpus under an explicit batch time budget; resume unfinished batches before claiming full runnable coverage. Add repeats if useful within the user's authorized scope. A single complete brief normally gives each fresh attempt one user prompt. This does not establish that a real user would never need to correct it.
 
 Automated grading needs no mandatory human scoring step. Preserve grading errors and unknown evidence instead of inventing scores. Show task success, output quality %, and efficiency % together with raw time, prompt counts, dollars, coverage, and evidence. Unknown cost is not zero. Report configuration differences and comparison warnings.
+
+## Complete the operational loop
+
+Run the complete selected window through the supported CLI. Check that source inventory, mapped user requests, recovered inputs, declared gaps, and trial coverage agree. Repair preparation, execution, resume, and report failures and repeat the affected stage before handing back. Unit tests or a hand-selected subset alone do not establish a working history evaluation. A candidate failing a correctly prepared task is a valid result, not a reason to change criteria or keep retrying it. Genuine absent history or unavailable live capabilities stay explicit; do not invent fixtures or silently replace the goal to manufacture full coverage.
 
 ## Data and execution boundaries
 

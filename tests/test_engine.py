@@ -257,3 +257,562 @@ class BudgetRegressionTests(unittest.TestCase):
             )
             self.assertEqual(result["run_status"], "budget_stopped")
             self.assertEqual(result["trials"], [])
+
+
+class ParallelEngineTests(unittest.TestCase):
+    def test_workers_overlap_checkpoint_completions_and_keep_manifest_order(self):
+        import threading
+        import time
+
+        barrier = threading.Barrier(2)
+        lock = threading.Lock()
+        active = 0
+        maximum = 0
+        snapshots = []
+        from personalbench.privacy import write_json as save_json
+
+        def checkpoint(path, value):
+            snapshots.append([row["task_id"] for row in value["trials"]])
+            save_json(path, value)
+
+        def runner(task, config, workspace, **kwargs):
+            nonlocal active, maximum
+            with lock:
+                active += 1
+                maximum = max(maximum, active)
+            try:
+                if task["id"] in ("a", "b"):
+                    barrier.wait(timeout=2)
+                if task["id"] == "a":
+                    time.sleep(0.05)
+                return run_candidate(task, config, workspace, **kwargs)
+            finally:
+                with lock:
+                    active -= 1
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch("personalbench.engine.run_candidate", side_effect=runner),
+            patch("personalbench.engine.write_json", side_effect=checkpoint),
+        ):
+            result = evaluate(
+                benchmark(("a", "b", "c")),
+                fixture(("a", "b", "c")),
+                Path(directory) / "run",
+                workers=2,
+            )
+        self.assertEqual(maximum, 2)
+        self.assertEqual([row["task_id"] for row in result["trials"]], ["a", "b", "c"])
+        self.assertIn(["b"], snapshots)
+        self.assertEqual(result["summary"]["success_pct"], 100)
+
+    def test_parallel_spend_stops_scheduling_after_the_inflight_wave(self):
+        import threading
+
+        barrier = threading.Barrier(2)
+        called = []
+
+        def runner(task, config, workspace, **kwargs):
+            called.append(task["id"])
+            barrier.wait(timeout=2)
+            return run_candidate(task, config, workspace, **kwargs)
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch("personalbench.engine.run_candidate", side_effect=runner),
+        ):
+            result = evaluate(
+                benchmark(("a", "b", "c")),
+                fixture(("a", "b", "c")),
+                Path(directory) / "run",
+                workers=2,
+                stop_after_cost_usd=0.5,
+            )
+        self.assertEqual(set(called), {"a", "b"})
+        self.assertEqual(result["run_status"], "budget_stopped")
+        self.assertEqual(len(result["trials"]), 2)
+        self.assertIsNone(result["summary"]["success_pct"])
+
+    def test_parallel_judges_have_independent_call_logs(self):
+        import threading
+
+        logs = []
+        barrier = threading.Barrier(2)
+
+        def callback(config, *, calls, **kwargs):
+            logs.append(calls)
+
+            def judge(prompt):
+                barrier.wait(timeout=2)
+                calls.append({"status": "completed", "cost_usd": 0.1})
+                return '{"scores":[{"id":"check","score":1,"evidence":"Synthetic check passed"}]}'
+
+            return judge
+
+        bench = benchmark(("a", "b"))
+        for task in bench["tasks"]:
+            task["criteria"][0]["kind"] = "judge"
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch("personalbench.engine.model_callback", side_effect=callback),
+        ):
+            result = evaluate(
+                bench,
+                fixture(("a", "b")),
+                Path(directory) / "run",
+                workers=2,
+                judge_config=fixture(),
+                allow_unsafe_local=True,
+            )
+        self.assertEqual(len(logs), 2)
+        self.assertIsNot(logs[0], logs[1])
+        self.assertEqual([row["task_id"] for row in result["judge_calls"]], ["a", "b"])
+        self.assertEqual(result["summary"]["success_pct"], 100)
+
+    def test_worker_failure_is_preserved_without_losing_other_tasks(self):
+        def runner(task, config, workspace, **kwargs):
+            if task["id"] == "b":
+                raise RuntimeError("Synthetic worker failure")
+            return run_candidate(task, config, workspace, **kwargs)
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch("personalbench.engine.run_candidate", side_effect=runner),
+        ):
+            result = evaluate(
+                benchmark(("a", "b")),
+                fixture(("a", "b")),
+                Path(directory) / "run",
+                workers=2,
+            )
+        self.assertEqual(result["trials"][0]["status"], "completed")
+        self.assertEqual(result["trials"][1]["status"], "infrastructure_error")
+        self.assertIn("Synthetic worker failure", result["trials"][1]["error"])
+        self.assertIsNone(result["trials"][1]["grading"]["success"])
+
+    def test_resume_rejects_worker_changes_and_accepts_legacy_serial_reports(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "parallel"
+            evaluate(benchmark(), fixture(), output, workers=2)
+            with self.assertRaisesRegex(ValueError, "Cannot resume"):
+                evaluate(benchmark(), fixture(), output, workers=1, resume=True)
+            with patch(
+                "personalbench.engine.run_candidate", side_effect=AssertionError("Duplicate")
+            ):
+                evaluate(benchmark(), fixture(), output, workers=2, resume=True)
+            serial = Path(directory) / "serial"
+            evaluate(benchmark(), fixture(), serial)
+            path = serial / "report.json"
+            old = json.loads(path.read_text())
+            del old["execution"]
+            path.write_text(json.dumps(old))
+            evaluate(benchmark(), fixture(), serial, resume=True)
+
+    def test_parallel_interrupt_reaps_native_children_and_resumes_only_unfinished(self):
+        import os
+        import signal
+        import subprocess
+        import time
+
+        def running(pid):
+            state = subprocess.run(
+                ["ps", "-o", "stat=", "-p", str(pid)],
+                capture_output=True,
+                text=True,
+                check=False,
+            ).stdout.strip()
+            return bool(state) and not state.startswith("Z")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            candidate = root / "candidate.py"
+            candidate.write_text(
+                "import json,sys,subprocess,time\nfrom pathlib import Path\n"
+                'request=json.load(sys.stdin)\nroot=Path(sys.argv[1])\ntid=request["task"]["id"]\n'
+                'with (root/"attempts").open("a") as log: log.write(tid+"\\n")\n'
+                'if tid!="a" and not (root/"release").exists():\n'
+                ' child=subprocess.Popen([sys.executable,"-c","import time;time.sleep(30)"])\n'
+                ' (root/(tid+".pid")).write_text(json.dumps([__import__("os").getpid(),child.pid]))\n'
+                " time.sleep(30)\n"
+                'print(json.dumps({"output":"done","usage":{}}))\n'
+            )
+            config = {
+                "name": "Synthetic interrupt process",
+                "harness": "command",
+                "model": "synthetic",
+                "command": [sys.executable, str(candidate), str(root)],
+                "timeout_seconds": 30,
+            }
+            (root / "benchmark.json").write_text(json.dumps(benchmark(("a", "b", "c"))))
+            (root / "config.json").write_text(json.dumps(config))
+            controller = root / "evaluate.py"
+            controller.write_text(
+                "import sys,json\nfrom pathlib import Path\nfrom personalbench.engine import evaluate\n"
+                "root=Path(sys.argv[1])\n"
+                'evaluate(json.loads((root/"benchmark.json").read_text()),'
+                'json.loads((root/"config.json").read_text()),root/"run",workers=2,'
+                "allow_unsafe_local=True,resume=len(sys.argv)>2)\n"
+            )
+            process = subprocess.Popen(
+                [sys.executable, str(controller), str(root)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            pids = []
+            try:
+                deadline = time.monotonic() + 5
+                while not all((root / (tid + ".pid")).exists() for tid in ("b", "c")):
+                    if time.monotonic() > deadline:
+                        self.fail("Parallel synthetic candidates did not start")
+                    time.sleep(0.01)
+                pids = [
+                    pid
+                    for tid in ("b", "c")
+                    for pid in json.loads((root / (tid + ".pid")).read_text())
+                ]
+                process.send_signal(signal.SIGINT)
+                process.communicate(timeout=5)
+                saved = json.loads((root / "run/report.json").read_text())
+                self.assertEqual(saved["run_status"], "interrupted")
+                self.assertEqual([row["task_id"] for row in saved["trials"]], ["a"])
+                deadline = time.monotonic() + 2
+                while any(running(pid) for pid in pids) and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertFalse(
+                    any(running(pid) for pid in pids), "Interrupted process group survived"
+                )
+                (root / "release").touch()
+                subprocess.run(
+                    [sys.executable, str(controller), str(root), "resume"],
+                    capture_output=True,
+                    check=True,
+                    timeout=5,
+                )
+                resumed = json.loads((root / "run/report.json").read_text())
+                self.assertEqual(resumed["run_status"], "complete")
+                self.assertEqual(len(resumed["trials"]), 3)
+                self.assertEqual((root / "attempts").read_text().splitlines().count("a"), 1)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate()
+                for pid in pids:
+                    if running(pid):
+                        os.kill(pid, signal.SIGKILL)
+
+    def test_grader_command_cancellation_reaps_its_process_group(self):
+        import os
+        import signal
+        import subprocess
+        import threading
+        import time
+        from concurrent.futures import ThreadPoolExecutor
+
+        from personalbench.grading import grade
+        from personalbench.runners import execution_cancellation
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pidfile = root / "grader.pid"
+            code = (
+                "import subprocess,sys,time\nfrom pathlib import Path\n"
+                'child=subprocess.Popen([sys.executable,"-c","import time;time.sleep(30)"])\n'
+                f"Path({str(pidfile)!r}).write_text(str(child.pid))\n"
+                "time.sleep(30)\n"
+            )
+            task = {
+                "criteria": [
+                    {
+                        "id": "check",
+                        "kind": "command",
+                        "value": [sys.executable, "check.py"],
+                        "tests": {"check.py": code},
+                        "timeout_seconds": 30,
+                    }
+                ]
+            }
+            cancelled = threading.Event()
+
+            def assess():
+                with execution_cancellation(cancelled):
+                    return grade(task, {"output": "done"}, root, allow_unsafe_local=True)
+
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(assess)
+                try:
+                    deadline = time.monotonic() + 3
+                    while not pidfile.exists():
+                        if time.monotonic() > deadline:
+                            self.fail("Synthetic command grader did not start")
+                        time.sleep(0.01)
+                    child = int(pidfile.read_text())
+                    cancelled.set()
+                    with self.assertRaises(KeyboardInterrupt):
+                        future.result(timeout=3)
+                    state = subprocess.run(
+                        ["ps", "-o", "stat=", "-p", str(child)],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    ).stdout.strip()
+                    self.assertTrue(not state or state.startswith("Z"))
+                finally:
+                    cancelled.set()
+                    if pidfile.exists():
+                        child = int(pidfile.read_text())
+                        try:
+                            os.kill(child, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+
+    def test_interrupted_output_assessment_resumes_without_rerunning_candidate(self):
+        bench = benchmark()
+        bench["tasks"][0]["criteria"][0]["kind"] = "judge"
+
+        def interrupted(config, *, calls, **kwargs):
+            def assess(prompt):
+                calls.append({"status": "completed", "cost_usd": 0.1})
+                raise KeyboardInterrupt
+
+            return assess
+
+        def completed(config, *, calls, **kwargs):
+            def assess(prompt):
+                calls.append({"status": "completed", "cost_usd": 0.2})
+                return '{"scores":[{"id":"check","score":1,"evidence":"done"}]}'
+
+            return assess
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "run"
+            with (
+                patch("personalbench.engine.model_callback", side_effect=interrupted),
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                evaluate(bench, fixture(), output, judge_config=fixture(), allow_unsafe_local=True)
+            saved = json.loads((output / "report.json").read_text())
+            self.assertTrue(saved["trials"][0]["assessment_interrupted"])
+            with (
+                patch("personalbench.engine.model_callback", side_effect=completed),
+                patch(
+                    "personalbench.engine.run_candidate",
+                    side_effect=AssertionError("Candidate reran"),
+                ),
+            ):
+                result = evaluate(
+                    bench,
+                    fixture(),
+                    output,
+                    judge_config=fixture(),
+                    allow_unsafe_local=True,
+                    resume=True,
+                )
+            self.assertEqual(len(result["trials"]), 1)
+            self.assertEqual(result["summary"]["success_pct"], 100)
+            self.assertEqual([row["cost_usd"] for row in result["judge_calls"]], [0.1, 0.2])
+            self.assertEqual(result["trials"][0]["cost_usd"], 0.6)
+            self.assertNotIn("assessment_interrupted", result["trials"][0])
+
+    def test_interrupted_file_assessment_restores_captured_candidate_artifact(self):
+        bench = benchmark()
+        bench["tasks"][0]["criteria"] = [
+            {
+                "id": "file",
+                "kind": "file_contains",
+                "description": "Expected file",
+                "target": "answer.txt",
+                "value": "candidate answer",
+            },
+        ]
+
+        def candidate(task, config, workspace, **kwargs):
+            (workspace / "answer.txt").write_text("candidate answer")
+            return run_candidate(task, config, workspace, **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "run"
+            with (
+                patch("personalbench.engine.run_candidate", side_effect=candidate),
+                patch("personalbench.engine.grade", side_effect=KeyboardInterrupt),
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                evaluate(bench, fixture(), output)
+            saved = json.loads((output / "report.json").read_text())
+            self.assertEqual(saved["trials"][0]["artifacts"], {"answer.txt": "candidate answer"})
+            with patch(
+                "personalbench.engine.run_candidate", side_effect=AssertionError("Candidate reran")
+            ):
+                resumed = evaluate(bench, fixture(), output, resume=True)
+            self.assertEqual(resumed["summary"]["success_pct"], 100)
+
+    def test_recorded_historical_cost_does_not_consume_new_judging_budget(self):
+        bench = benchmark(("a", "b"))
+        for task in bench["tasks"]:
+            task["criteria"][0]["kind"] = "judge"
+            task["historical"]["cost_usd"] = 100
+
+        def callback(config, *, calls, **kwargs):
+            def assess(prompt):
+                calls.append({"status": "completed", "cost_usd": 0.1})
+                return '{"scores":[{"id":"check","score":1,"evidence":"done"}]}'
+
+            return assess
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch("personalbench.engine.model_callback", side_effect=callback),
+        ):
+            result = evaluate(
+                bench,
+                fixture(("a", "b")),
+                Path(directory) / "run",
+                baseline_type="recorded",
+                judge_config=fixture(),
+                allow_unsafe_local=True,
+                stop_after_cost_usd=0.5,
+            )
+        self.assertEqual(result["run_status"], "complete")
+        self.assertEqual(len(result["trials"]), 2)
+
+    def test_shortened_final_attempt_reports_batch_budget_without_false_failure(self):
+        config = {
+            "name": "Slow synthetic",
+            "harness": "command",
+            "model": "synthetic",
+            "timeout_seconds": 10,
+            "command": [sys.executable, "-c", "import time; time.sleep(10)"],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            result = evaluate(
+                benchmark(),
+                config,
+                Path(directory) / "run",
+                allow_unsafe_local=True,
+                max_total_seconds=0.2,
+            )
+        self.assertEqual(result["run_status"], "budget_stopped")
+        self.assertEqual(result["trials"][0]["status"], "batch_budget_exceeded")
+        self.assertIsNone(result["summary"]["success_pct"])
+
+    def test_explicit_resume_retries_only_batch_truncation_and_keeps_overhead(self):
+        config = {
+            "name": "Synthetic resumable process",
+            "harness": "command",
+            "model": "synthetic",
+            "timeout_seconds": 10,
+            "command": [
+                sys.executable,
+                "-c",
+                'import time,json;time.sleep(0.3);print(json.dumps({"output":"done","usage":{},"cost_usd":0.1}))',
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "run"
+            first = evaluate(
+                benchmark(), config, output, allow_unsafe_local=True, max_total_seconds=0.2
+            )
+            self.assertEqual(first["trials"][0]["status"], "batch_budget_exceeded")
+            second = evaluate(
+                benchmark(),
+                config,
+                output,
+                allow_unsafe_local=True,
+                max_total_seconds=2,
+                resume=True,
+            )
+            self.assertEqual(second["run_status"], "complete")
+            self.assertEqual(second["summary"]["success_pct"], 100)
+            self.assertEqual(len(second["trials"]), 1)
+            self.assertEqual(len(second["retry_history"]), 1)
+            self.assertEqual(second["trials"][0]["user_prompts"], 2)
+            self.assertGreaterEqual(second["trials"][0]["duration_seconds"], 0.5)
+            self.assertIsNone(second["trials"][0]["cost_usd"])
+            self.assertEqual(second["trials"][0]["latest_attempt"]["cost_usd"], 0.1)
+            with patch(
+                "personalbench.engine.run_candidate",
+                side_effect=AssertionError("Duplicate completed candidate"),
+            ):
+                evaluate(
+                    benchmark(),
+                    config,
+                    output,
+                    allow_unsafe_local=True,
+                    max_total_seconds=2,
+                    resume=True,
+                )
+            # A full declared task timeout remains a scored failure, never a retry target.
+            failed = Path(directory) / "full-timeout"
+            short = dict(config, timeout_seconds=0.1)
+            result = evaluate(
+                benchmark(), short, failed, allow_unsafe_local=True, max_total_seconds=2
+            )
+            self.assertEqual(result["trials"][0]["status"], "budget_exceeded")
+            with patch(
+                "personalbench.engine.run_candidate",
+                side_effect=AssertionError("Retried full task timeout"),
+            ):
+                resumed = evaluate(
+                    benchmark(),
+                    short,
+                    failed,
+                    allow_unsafe_local=True,
+                    max_total_seconds=3,
+                    resume=True,
+                )
+            self.assertEqual(resumed["summary"]["success_pct"], 0)
+            self.assertEqual(resumed["retry_history"], [])
+
+    def test_grading_budget_extension_reuses_candidate_and_preserves_judge_spend(self):
+        import time
+
+        bench = benchmark()
+        bench["tasks"][0]["criteria"][0]["kind"] = "judge"
+
+        def slow(config, *, calls, **kwargs):
+            def assess(prompt):
+                time.sleep(0.25)
+                calls.append({"status": "completed", "cost_usd": 0.1})
+                return '{"scores":[{"id":"check","score":1,"evidence":"done"}]}'
+
+            return assess
+
+        def fast(config, *, calls, **kwargs):
+            def assess(prompt):
+                calls.append({"status": "completed", "cost_usd": 0.2})
+                return '{"scores":[{"id":"check","score":1,"evidence":"done"}]}'
+
+            return assess
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "run"
+            with patch("personalbench.engine.model_callback", side_effect=slow):
+                first = evaluate(
+                    bench,
+                    fixture(),
+                    output,
+                    judge_config=fixture(),
+                    allow_unsafe_local=True,
+                    max_total_seconds=0.2,
+                )
+            self.assertEqual(first["run_status"], "budget_stopped")
+            self.assertTrue(first["trials"][0]["budget_limited"])
+            with (
+                patch("personalbench.engine.model_callback", side_effect=fast),
+                patch(
+                    "personalbench.engine.run_candidate",
+                    side_effect=AssertionError("Candidate reran"),
+                ),
+            ):
+                final = evaluate(
+                    bench,
+                    fixture(),
+                    output,
+                    judge_config=fixture(),
+                    allow_unsafe_local=True,
+                    max_total_seconds=2,
+                    resume=True,
+                )
+            self.assertEqual(final["run_status"], "complete")
+            self.assertEqual(final["summary"]["success_pct"], 100)
+            self.assertEqual([row["cost_usd"] for row in final["judge_calls"]], [0.1, 0.2])
