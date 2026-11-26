@@ -300,6 +300,34 @@ def test_user_mentions_of_ambient_tags_are_preserved(tmp_path):
     assert import_session(path)["messages"][0]["text"] == text
 
 
+def test_plugin_and_skill_envelopes_are_not_goals_but_following_requests_survive(tmp_path):
+    rows = [
+        {"type": "event_msg", "payload": {"type": "user_message", "message": text}}
+        for text in [
+            "<recommended_plugins>Installable tools</recommended_plugins>",
+            "<skill><name>example</name>Instructions</skill>\nExplain queues.",
+        ]
+    ]
+    assert [m["text"].strip() for m in import_session(write_rows(tmp_path, rows))["messages"]] == [
+        "Explain queues."
+    ]
+
+
+def test_question_reply_keeps_clarification_without_internal_identifiers(tmp_path):
+    reply = [{"questionItemId": "internal-id", "question": "Which format?", "answer": "HTML"}]
+    text = (
+        "<send_user_message_question_reply>"
+        + json.dumps(reply)
+        + ("</send_user_message_question_reply>")
+    )
+    path = write_rows(
+        tmp_path, [{"type": "event_msg", "payload": {"type": "user_message", "message": text}}]
+    )
+    assert import_session(path)["messages"][0]["text"] == (
+        "Question: Which format?\nUser answer: HTML"
+    )
+
+
 def test_goal_source_indices_map_historical_output_without_inventing_cost():
     session = {
         "messages": [
@@ -383,3 +411,45 @@ def test_unicode_line_separators_inside_json_strings_remain_one_record(tmp_path)
     session = import_session(source)
     assert len(session["messages"]) == 2
     assert session["messages"][0]["text"] == text
+
+
+def test_strict_preparation_cannot_silently_drop_user_requests():
+    session = {
+        "messages": [
+            {"role": "user", "text": "Explain stacks"},
+            {"role": "user", "text": "Explain queues"},
+        ]
+    }
+    compiled = {
+        "tasks": [
+            {
+                "id": "stack",
+                "brief": "Explain stacks",
+                "requires_starting_state": False,
+                "source_message_indices": [0],
+                "criteria": [{"id": "ok", "description": "Accurate explanation"}],
+            }
+        ]
+    }
+    with pytest.raises(ValueError, match="unaccounted"):
+        build_benchmark(session, compiler=lambda _: json.dumps(compiled), strict=True)
+    compiled["exclusions"] = [{"source_message_indices": [1], "reason": ""}]
+    with pytest.raises(ValueError, match="concrete reason"):
+        build_benchmark(session, compiler=lambda _: json.dumps(compiled), strict=True)
+
+
+def test_strict_preparation_supports_audited_non_work_without_fake_tasks():
+    result = build_benchmark(
+        {"messages": [{"role": "user", "text": "Reply exactly ACCESS_OK"}]},
+        compiler=lambda _: json.dumps(
+            {
+                "tasks": [],
+                "exclusions": [
+                    {"source_message_indices": [0], "reason": "Harness model-access probe"}
+                ],
+            }
+        ),
+        strict=True,
+    )
+    assert result["tasks"] == []
+    assert result["preparation_exclusions"]

@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -9,7 +10,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from personalbench.runners import RunnerError, execute, run_candidate, token_cost
+from personalbench.runners import (
+    RunnerError,
+    adapter_identity,
+    codex_permissions,
+    execute,
+    run_candidate,
+    token_cost,
+)
 
 
 def is_running(pid):
@@ -89,6 +97,77 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(result["output"], "")
             self.assertIsNone(result["cost_usd"])
 
+    def test_codex_scope_permissions_and_tool_trace_are_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            executable = root / "codex"
+            executable.write_text(
+                f"#!{sys.executable}\nimport sys,json\n"
+                "prompt=sys.stdin.read()\n"
+                "print(json.dumps({'type':'item.completed','item':{'type':'command_execution',"
+                "'command':'cat sources/input.json','aggregated_output':'fixture'}}))\n"
+                "print(json.dumps({'type':'item.completed','item':{'type':'agent_message',"
+                "'text':json.dumps({'argv':sys.argv,'prompt':prompt})}}))\n"
+                "print(json.dumps({'type':'turn.completed','usage':{}}))\n"
+            )
+            executable.chmod(0o700)
+            task = {**self.task(), "inputs": {"sources/input.json": "fixture"}}
+            config = {
+                "name": "Codex probe",
+                "harness": "codex",
+                "model": "synthetic",
+                "tools": "workspace",
+                "sandbox": "workspace-write",
+            }
+            with patch.dict(os.environ, {"PATH": str(root), "CODEX_HOME": str(root / "empty")}):
+                result = run_candidate(task, config, root, allow_unsafe_local=True)
+            self.assertEqual(result["status"], "completed")
+            received = json.loads(result["output"])
+            self.assertNotIn("--sandbox", received["argv"])
+            self.assertIn('default_permissions="personalbench"', received["argv"])
+            permissions = next(
+                x for x in received["argv"] if x.startswith("permissions.personalbench.filesystem=")
+            )
+            self.assertIn('":minimal"="read"', permissions)
+            self.assertIn('":workspace_roots"={"."="write"}', permissions)
+            self.assertNotIn("extends", permissions)
+            self.assertIn("ONLY the supplied task brief", received["prompt"])
+            self.assertIn("command_execution", result["execution_trace"]["stdout"])
+            self.assertEqual(result["execution_trace"]["returncode"], 0)
+            self.assertEqual(
+                adapter_identity(config)["input_boundary"], "workspace-minimal-read-v1"
+            )
+
+    @unittest.skipUnless(sys.platform == "darwin" and shutil.which("codex"), "macOS Codex required")
+    def test_real_codex_sandbox_denies_host_and_symlink_reads(self):
+        # No model/API request: exercise the very same permission rules with Seatbelt.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            workspace = root / "workspace"
+            workspace.mkdir()
+            (workspace / "allowed").write_text("captured evidence")
+            outside = root / "private-original-session"
+            outside.write_text("original answer must not be readable")
+            (workspace / "escape").symlink_to(outside)
+            env = {**os.environ, "CODEX_HOME": str(root / "codex-home")}
+            Path(env["CODEX_HOME"]).mkdir()
+            executable = str(Path(shutil.which("codex")).resolve())
+            argv = [executable, "sandbox", "-P", "personalbench", "-C", str(workspace)]
+            argv += codex_permissions("write", executable)
+            argv += [
+                "/bin/sh",
+                "-c",
+                'cat allowed && ! cat "$1" && ! cat escape',
+                "probe",
+                str(outside),
+            ]
+            probe = subprocess.run(
+                argv, env=env, capture_output=True, text=True, timeout=15, check=False
+            )
+            self.assertEqual(probe.returncode, 0, probe.stderr)
+            self.assertEqual(probe.stdout, "captured evidence")
+            self.assertEqual(probe.stderr.count("Operation not permitted"), 2)
+
     def test_invalid_json_nonfinite_cost_and_output_limit_are_errors(self):
         scripts = [
             "print('not json')",
@@ -123,6 +202,7 @@ class RunnerTests(unittest.TestCase):
                 allow_unsafe_local=True,
             )
             self.assertEqual(result["status"], "budget_exceeded")
+            self.assertIn("argv", result["execution_trace"])
             pid = int(pidfile.read_text())
             try:
                 deadline = time.monotonic() + 2

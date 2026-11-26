@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 import json
 import math
+from collections import Counter
 
 
 def _escape(value: object) -> str:
@@ -35,15 +36,85 @@ def render_report(report: dict) -> str:
         if baseline == "recorded"
         else "Fresh run. Results describe this complete setup on these tasks, tools, and budgets."
     )
-    cards = "".join(
-        f'<div class="metric"><span>{label}</span><strong>{_percent(summary.get(key))}</strong></div>'
-        for key, label in (
-            ("output_quality_pct", "Output quality"),
-            ("success_pct", "Success"),
-            ("efficiency_pct", "Efficiency"),
+    scope_notice = (
+        f'<p class="notice">{_escape(report["scope_note"])}</p>' if report.get("scope_note") else ""
+    )
+    cards = []
+    for key, label in (
+        ("output_quality_pct", "Output quality"),
+        ("success_pct", "Success"),
+        ("efficiency_pct", "Efficiency"),
+    ):
+        value = summary.get(key)
+        observed_key = (
+            "observed_quality_pct" if key == "output_quality_pct" else "observed_success_pct"
         )
+        if value is None and key != "efficiency_pct" and summary.get(observed_key) is not None:
+            value = summary[observed_key]
+            label = "Graded task " + ("quality" if key == "output_quality_pct" else "success")
+        cards.append(
+            f'<div class="metric"><span>{label}</span><strong>{_percent(value)}</strong></div>'
+        )
+    cards = "".join(cards)
+    definitions = report.get("task_manifest", [])
+    replay_coverage = ""
+    if isinstance(definitions, list) and definitions:
+        ready_ids = {
+            task.get("id")
+            for task in definitions
+            if isinstance(task, dict) and (task.get("readiness") or "ready") == "ready"
+        }
+        graded_ready = sum(
+            task.get("task_id") in ready_ids and task.get("complete", False)
+            for task in summary.get("tasks", [])
+        )
+        gaps = len(definitions) - len(ready_ids)
+        gap_label = "goal has" if gaps == 1 else "goals have"
+        replay_coverage = (
+            f"<p>Replay coverage: {graded_ready}/{len(ready_ids)} ready goals fully graded. "
+            f"{gaps} {gap_label} declared input or capability gaps.</p>"
+        )
+    titles = (
+        {
+            task.get("id"): str(task.get("brief", "")).split("\n", 1)[0][:140]
+            for task in definitions
+            if isinstance(task, dict)
+        }
+        if isinstance(definitions, list)
+        else {}
     )
     coverage = summary.get("coverage", {})
+    observed_note = ""
+    if (
+        coverage.get("scored_trials", 0) < coverage.get("expected_trials", 0)
+        and summary.get("observed_quality_pct") is not None
+    ):
+        observed_note = (
+            "<p>Graded subset only: success "
+            + _percent(summary.get("observed_success_pct"))
+            + "; output quality "
+            + _percent(summary.get("observed_quality_pct"))
+            + ". These scores exclude unscorable goals and do not establish an overall score.</p>"
+        )
+    history = report.get("history")
+    history_section = ""
+    if isinstance(history, dict):
+        counts = Counter(row.get("status", "unknown") for row in history.get("sessions", []))
+        history_section = (
+            "<section><h2>Source coverage</h2><p>History window: "
+            + _escape(history.get("since", "unknown"))
+            + " to "
+            + _escape(history.get("as_of", "unknown"))
+            + ". Source sessions: "
+            + _escape(sum(counts.values()))
+            + ". "
+            + _escape(", ".join(f"{status}: {count}" for status, count in sorted(counts.items())))
+            + ".</p><p>Task scores cover the declared benchmark only. Excluded sources and "
+            "preparation errors do not count as successful tasks.</p>"
+            "<details><summary>Source inventory and preparation decisions</summary><pre>"
+            + _json(history)
+            + "</pre></details></section>"
+        )
     rows = []
     for task in summary.get("tasks", []):
         reliability = task.get("reliability", {})
@@ -52,7 +123,7 @@ def render_report(report: dict) -> str:
             + "".join(
                 f"<td>{value}</td>"
                 for value in (
-                    _escape(task.get("task_id", "")),
+                    _escape(titles.get(task.get("task_id")) or task.get("task_id", "")),
                     _escape(task.get("category", "")),
                     _percent(task.get("output_quality_pct")),
                     _percent(task.get("success_pct")),
@@ -144,6 +215,13 @@ def render_report(report: dict) -> str:
                 "error",
             )
         }
+        trace = (
+            "<details><summary>Native execution trace</summary><pre>"
+            + _json(trial["execution_trace"])
+            + "</pre></details>"
+            if trial.get("execution_trace")
+            else ""
+        )
         attempts.append(
             f"<details><summary>Attempt {index}: {_escape(trial.get('task_id', ''))} "
             f"· repeat {_escape(trial.get('repeat', 'unknown'))}</summary>"
@@ -151,7 +229,7 @@ def render_report(report: dict) -> str:
             f"Quality: {_percent(grading.get('quality_pct'))}.</p>"
             f"<p>{_escape(grading.get('error', ''))}</p><ul>{''.join(evidence)}</ul>"
             f"<h3>Measurements</h3><pre>{_json(metadata)}</pre>"
-            f"<h3>Candidate output</h3><pre>{_escape(output)}</pre></details>"
+            f"<h3>Candidate output</h3><pre>{_escape(output)}</pre>{trace}</details>"
         )
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -174,11 +252,15 @@ section {{ margin:32px 0; }} @media(max-width:500px) {{ body {{ padding:16px; }}
 @media print {{ body {{ color:#111; background:white; }} .metric,.notice,pre {{ color:#111; background:#eee; }} details {{ break-inside:avoid; }} }}
 </style></head><body><header><p class="muted">PERSONALBENCH · PRIVATE REPORT</p>
 <h1>{_escape(name)}</h1><p>{_escape(report.get("created_at", ""))}</p>
-<p class="notice">{_escape(notice)}</p></header><main>
+<p>Run status: <strong>{_escape(report.get("run_status", "unknown"))}</strong>.</p>
+<p class="notice">{_escape(notice)}</p>{scope_notice}</header><main>
 <section aria-label="Headline scores"><div class="metrics">{cards}</div>
+{replay_coverage}
 <p>Graded trials: {_escape(coverage.get("scored_trials", 0))}/{_escape(coverage.get("expected_trials", 0))}.
 Complete tasks: {_escape(coverage.get("complete_tasks", 0))}/{_escape(coverage.get("total_tasks", 0))}.</p>
 <p class="muted">Unavailable means evidence is missing. Missing results never count as passing results.</p></section>
+{observed_note}
+{history_section}
 <section><h2>Results by task</h2><div class="table-wrap"><table><caption>Tasks have equal weight in the headline scores.</caption>
 <thead><tr><th scope="col">Task</th><th scope="col">Category</th><th scope="col">Quality</th><th scope="col">Success</th><th scope="col">Efficiency</th><th scope="col">Graded repeats</th><th scope="col">Reliability</th></tr></thead>
 <tbody>{"".join(rows)}</tbody></table></div></section>
@@ -193,5 +275,5 @@ Complete tasks: {_escape(coverage.get("complete_tasks", 0))}/{_escape(coverage.g
 Changes in models, tools, instructions, or budgets compare complete setups.</p></section>
 <section><h2>Attempt evidence</h2>{"".join(attempts) or "<p>No attempts were recorded.</p>"}</section>
 <section><h2>Reproducibility</h2><details><summary>Configuration and evidence identifiers</summary>
-<pre>{_json({"baseline_type": baseline, "benchmark_hash": report.get("benchmark_hash"), "scoring_hash": report.get("scoring_hash"), "configuration": config})}</pre></details></section>
+<pre>{_json({"baseline_type": baseline, "benchmark_hash": report.get("benchmark_hash"), "scoring_hash": report.get("scoring_hash"), "configuration": config, "runtime": report.get("runtime"), "execution": report.get("execution")})}</pre></details></section>
 </main><footer><p class="muted">Local HTML. No remote assets, tracking, or external scripts.</p></footer></body></html>"""

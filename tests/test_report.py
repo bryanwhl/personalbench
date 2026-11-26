@@ -16,16 +16,48 @@ class TagParser(HTMLParser):
 
 
 class ReportTests(unittest.TestCase):
+    def test_replay_coverage_distinguishes_completed_ready_goals_from_declared_gaps(self):
+        result = render_report(
+            {
+                "run_status": "complete",
+                "task_manifest": [
+                    {"id": "ready", "readiness": "ready"},
+                    {"id": "gap", "readiness": "unsupported"},
+                ],
+                "summary": {"tasks": [{"task_id": "ready", "complete": True}]},
+            }
+        )
+        self.assertIn("1/1 ready goals fully graded", result)
+        self.assertIn("1 goal has declared input or capability gaps", result)
+        self.assertIn("Run status: <strong>complete</strong>", result)
+
+    def test_partial_coverage_labels_observed_scores_as_subset_only(self):
+        rendered = render_report(
+            {
+                "summary": {
+                    "coverage": {"scored_trials": 1, "expected_trials": 2},
+                    "observed_success_pct": 100,
+                    "observed_quality_pct": 90,
+                }
+            }
+        )
+        self.assertIn("Graded subset only: success 100.0%; output quality 90.0%", rendered)
+        self.assertIn("do not establish an overall score", rendered)
+        self.assertIn("Unavailable", rendered)
+
     def test_injection_escaped_everywhere_and_no_remote_assets(self):
         payload = '<script>alert("oops")</script><img src="https://example.com/x">'
         report = {
             "created_at": payload,
+            "scope_note": payload,
             "configuration": {"name": payload, "harness": "fixture"},
+            "runtime": {"input_boundary": payload},
             "summary": {"tasks": [{"task_id": payload, "category": payload}], "method": payload},
             "trials": [
                 {
                     "task_id": payload,
                     "output": payload,
+                    "execution_trace": {"stdout": payload},
                     "grading": {"criteria": [{"id": payload, "evidence": payload}]},
                 }
             ],
@@ -39,6 +71,7 @@ class ReportTests(unittest.TestCase):
         self.assertIn("&lt;script&gt;", rendered)
         self.assertIn("Synthetic fixture", rendered)
         self.assertIn("Content-Security-Policy", rendered)
+        self.assertIn("Native execution trace", rendered)
         self.assertIn("Unavailable", rendered)
 
     def test_recorded_label_and_empty_report(self):

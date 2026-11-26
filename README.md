@@ -33,9 +33,30 @@ personalbench report .personalbench/demo/report.json \
 
 Open `.personalbench/demo/report.html` in your browser. The fixture adapter returns predetermined synthetic answers: this demonstrates the workflow and **does not measure any real model**.
 
-## Make your own benchmark
+## Evaluate your recent work (default)
 
-Start with a small session whose goal and starting inputs are available. Codex sessions are commonly stored under `~/.codex/sessions/`; select a particular JSONL file rather than copying the whole directory into this repository.
+An unqualified Personalbench run uses the past **60 days** of available local Codex and Claude sessions. Distill the whole window into independent goals, consolidate equivalent fork histories and repeated tasks, and keep coverage across projects and task types. Independent goals with no user request or clarification inside the window are excluded; earlier messages remain context for recent goals. Missing historical files or connected sources remain explicit gaps; a transcript alone does not make a task replayable.
+
+```bash
+personalbench evaluate --config /path/to/candidate.json \
+  --output .personalbench/history --allow-unsafe-local
+```
+
+This single command discovers Codex and Claude sessions, freezes the 60-day window, recovers read-only historical inputs, compiles independent goals, runs fresh attempts, and writes `.personalbench/history/run/report.html`. The compiler and judge default to the candidate's explicitly selected model with tools disabled; use `--compiler` and `--judge` for separate configurations. Codex workspace attempts use a named filesystem profile that grants minimal runtime reads and the supplied workspace, with network access disabled. Native execution still requires trusted tasks.
+
+Preparation and execution each default to three workers and a 30-minute batch budget. Change them with `--preparation-workers`, `--workers`, `--max-preparation-seconds`, and `--max-total-seconds`. Stop and continue the same evaluation with the same command plus `--resume`; completed compilation and candidate attempts are retained. An interrupted output assessment can be retried without rerunning the candidate. Changing model configuration or scope requires a new output directory. Native adapter and input-boundary identities are recorded; preparation refresh starts fresh when the previous adapter differs, and comparisons reject different input boundaries. After fixing preparation, add `--resume --refresh-preparation` to revalidate the frozen inputs and cached goal compilation; changed benchmarks and runs receive a new revision while prior reports stay intact. Completed outcomes are reused only when the full task inputs, requirements, candidate setup, and grading context are unchanged; failures are retained as well as successes. Newly ready or changed goals receive new attempts.
+
+`--days`, `--as-of`, `--source`, repeatable `--session-root`, and repeatable `--exclude-session` override the default. `--exclude-session-id` excludes a chat and its descendants. The current Codex chat and internal agent threads are excluded automatically. Compressed `.jsonl.zst` logs use the optional `zstd` executable with decoded size and time limits. Later activity in a resumed chat does not exclude earlier eligible work: compiler messages and tool evidence are frozen at the cutoff.
+
+Every user request is mapped to a goal or an explicit preparation exclusion. Generated tasks include a mandatory validity check, so a high average rubric score cannot hide a missing core deliverable or fabricated evidence. Read-only source outputs are recovered by source ID, goal time bounds, timezone, and required source kinds; later mailbox observations cannot stand in for earlier ones. Tool metadata, the goal's own generated answers, and mutations are excluded. Read-only runtime or source observations from earlier independent work can support a later goal when request and mutation timing proves they are starting evidence. Exact fork prefixes and equivalent goals are consolidated without merging different dated account snapshots. Genuine missing inputs and unavailable live capabilities remain visible coverage gaps, rather than invented scores.
+
+The candidate receives only the prepared brief and preserved inputs. The compiler receives normalized messages and a source catalog; the judge receives criteria, preserved inputs, and the candidate's answer. Personal artifacts remain local; configured model providers receive that selected content. Raw logs, frozen sources, compilation records, criteria, native tool traces, execution evidence, and the report stay in the private output directory. Candidate coverage contains sufficiency information rather than original-log locators; private provenance retains the full audit. No collector or automatic publication is installed.
+
+For preparation without execution, use `personalbench build --compiler /path/to/compiler.json --output .personalbench/benchmark.json --allow-unsafe-local`. `build` without a session uses the same 60-day corpus; without a compiler it produces an explicitly labeled draft. `sessions` lists the source inventory without printing conversation contents. Review unknown evidence and category coverage when interpreting a score; a graded subset is not a whole-history score.
+
+## Make a benchmark from a selected session
+
+An explicit session or narrower range overrides the default. Codex sessions are commonly stored under `~/.codex/sessions/`.
 
 ```bash
 personalbench sessions
@@ -84,7 +105,7 @@ personalbench compare .personalbench/baseline/report.json \
   .personalbench/next/report.json --output .personalbench/comparison.json
 ```
 
-Each run records its configuration and benchmark/scoring identity. Incompatible benchmark versions, coverage, or baseline types receive a warning instead of a misleading score delta. Use `--resume` with the same run configuration to retain completed attempts after interruption.
+Each run records its configuration and benchmark/scoring identity. Incompatible benchmark versions, coverage, or baseline types receive a warning instead of a misleading score delta. When the same frozen historical gaps exist in both runs, quality/success can compare their identical fully graded prepared subset, explicitly labeled N/M. Missing evidence on a ready goal is not silently excluded. Use `--resume` with the same run configuration to retain completed attempts after interruption.
 
 Runs have per-attempt timeouts. Use `--max-total-seconds` to bound a batch across resumes (increase it explicitly to extend a stopped run), and `--stop-after-cost-usd` to stop scheduling after recorded spend reaches a threshold. The dollar threshold is **not a hard spending cap**: an in-flight request can exceed it, and unknown billing cannot be measured. Provider-side limits remain necessary for a guaranteed dollar ceiling.
 
@@ -122,7 +143,7 @@ The skill guides goal selection, state preservation, automated grading, and comp
 
 - Codex, Claude Code, and generic command integrations depend on installed CLIs and compatible accounts/models. A model name accepted by one harness is not automatically supported by another.
 - Native adapters start from minimal configuration rather than inheriting your hooks, plugins, or unrelated tools. Declare instructions and supported settings explicitly; use a custom adapter for a richer setup. The report describes the evaluated configuration, not an automatic copy of every desktop preference.
-- Workspaces are disposable. Native harness controls and an isolated directory are **not a security boundary for hostile code**. Native harnesses, custom commands, and command graders require `--allow-unsafe-local`. Use this only for trusted local work; run untrusted tasks inside a separate container or VM.
+- Workspaces are disposable. The Codex adapter confines reads with a minimal runtime/workspace permission profile, including symlink-escape checks. Other native adapter controls and an isolated directory are **not a security boundary for hostile code**. Native harnesses, custom commands, and command graders require `--allow-unsafe-local`. Use this only for trusted local work; run untrusted tasks inside a separate container or VM.
 - Research and planning quality can use an automated rubric judge. Judge output is evidence with limitations, not an independent proof. Original answers are not treated as unquestionable answer keys.
 - Historical conversion cannot reconstruct absent files, sources, timestamps, or billing. Unknown evidence is reported; tasks may need preparation before fresh execution.
 - Graders support output/file assertions, separately stored executable tests, and model rubrics. The [examples](examples/README.md) include a coding repair with behavioral tests and research/planning rubrics.
