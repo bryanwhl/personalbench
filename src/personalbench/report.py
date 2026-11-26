@@ -57,6 +57,23 @@ def render_report(report: dict) -> str:
         )
     cards = "".join(cards)
     definitions = report.get("task_manifest", [])
+    replay_coverage = ""
+    if isinstance(definitions, list) and definitions:
+        ready_ids = {
+            task.get("id")
+            for task in definitions
+            if isinstance(task, dict) and (task.get("readiness") or "ready") == "ready"
+        }
+        graded_ready = sum(
+            task.get("task_id") in ready_ids and task.get("complete", False)
+            for task in summary.get("tasks", [])
+        )
+        gaps = len(definitions) - len(ready_ids)
+        gap_label = "goal has" if gaps == 1 else "goals have"
+        replay_coverage = (
+            f"<p>Replay coverage: {graded_ready}/{len(ready_ids)} ready goals fully graded. "
+            f"{gaps} {gap_label} declared input or capability gaps.</p>"
+        )
     titles = (
         {
             task.get("id"): str(task.get("brief", "")).split("\n", 1)[0][:140]
@@ -235,8 +252,10 @@ section {{ margin:32px 0; }} @media(max-width:500px) {{ body {{ padding:16px; }}
 @media print {{ body {{ color:#111; background:white; }} .metric,.notice,pre {{ color:#111; background:#eee; }} details {{ break-inside:avoid; }} }}
 </style></head><body><header><p class="muted">PERSONALBENCH · PRIVATE REPORT</p>
 <h1>{_escape(name)}</h1><p>{_escape(report.get("created_at", ""))}</p>
+<p>Run status: <strong>{_escape(report.get("run_status", "unknown"))}</strong>.</p>
 <p class="notice">{_escape(notice)}</p>{scope_notice}</header><main>
 <section aria-label="Headline scores"><div class="metrics">{cards}</div>
+{replay_coverage}
 <p>Graded trials: {_escape(coverage.get("scored_trials", 0))}/{_escape(coverage.get("expected_trials", 0))}.
 Complete tasks: {_escape(coverage.get("complete_tasks", 0))}/{_escape(coverage.get("total_tasks", 0))}.</p>
 <p class="muted">Unavailable means evidence is missing. Missing results never count as passing results.</p></section>

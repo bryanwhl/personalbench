@@ -16,6 +16,21 @@ class TagParser(HTMLParser):
 
 
 class ReportTests(unittest.TestCase):
+    def test_replay_coverage_distinguishes_completed_ready_goals_from_declared_gaps(self):
+        result = render_report(
+            {
+                "run_status": "complete",
+                "task_manifest": [
+                    {"id": "ready", "readiness": "ready"},
+                    {"id": "gap", "readiness": "unsupported"},
+                ],
+                "summary": {"tasks": [{"task_id": "ready", "complete": True}]},
+            }
+        )
+        self.assertIn("1/1 ready goals fully graded", result)
+        self.assertIn("1 goal has declared input or capability gaps", result)
+        self.assertIn("Run status: <strong>complete</strong>", result)
+
     def test_partial_coverage_labels_observed_scores_as_subset_only(self):
         rendered = render_report(
             {
