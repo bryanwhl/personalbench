@@ -16,6 +16,20 @@ class TagParser(HTMLParser):
 
 
 class ReportTests(unittest.TestCase):
+    def test_partial_coverage_labels_observed_scores_as_subset_only(self):
+        rendered = render_report(
+            {
+                "summary": {
+                    "coverage": {"scored_trials": 1, "expected_trials": 2},
+                    "observed_success_pct": 100,
+                    "observed_quality_pct": 90,
+                }
+            }
+        )
+        self.assertIn("Graded subset only: success 100.0%; output quality 90.0%", rendered)
+        self.assertIn("do not establish an overall score", rendered)
+        self.assertIn("Unavailable", rendered)
+
     def test_injection_escaped_everywhere_and_no_remote_assets(self):
         payload = '<script>alert("oops")</script><img src="https://example.com/x">'
         report = {

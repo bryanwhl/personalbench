@@ -48,6 +48,18 @@ def render_report(report: dict) -> str:
         )
     )
     coverage = summary.get("coverage", {})
+    observed_note = ""
+    if (
+        coverage.get("scored_trials", 0) < coverage.get("expected_trials", 0)
+        and summary.get("observed_quality_pct") is not None
+    ):
+        observed_note = (
+            "<p>Graded subset only: success "
+            + _percent(summary.get("observed_success_pct"))
+            + "; output quality "
+            + _percent(summary.get("observed_quality_pct"))
+            + ". These scores exclude unscorable goals and do not establish an overall score.</p>"
+        )
     history = report.get("history")
     history_section = ""
     if isinstance(history, dict):
@@ -202,6 +214,7 @@ section {{ margin:32px 0; }} @media(max-width:500px) {{ body {{ padding:16px; }}
 <p>Graded trials: {_escape(coverage.get("scored_trials", 0))}/{_escape(coverage.get("expected_trials", 0))}.
 Complete tasks: {_escape(coverage.get("complete_tasks", 0))}/{_escape(coverage.get("total_tasks", 0))}.</p>
 <p class="muted">Unavailable means evidence is missing. Missing results never count as passing results.</p></section>
+{observed_note}
 {history_section}
 <section><h2>Results by task</h2><div class="table-wrap"><table><caption>Tasks have equal weight in the headline scores.</caption>
 <thead><tr><th scope="col">Task</th><th scope="col">Category</th><th scope="col">Quality</th><th scope="col">Success</th><th scope="col">Efficiency</th><th scope="col">Graded repeats</th><th scope="col">Reliability</th></tr></thead>
