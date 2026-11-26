@@ -45,6 +45,8 @@ personalbench build --compiler /path/to/compiler.json \
 
 `build` without a session discovers the corpus. `sessions` and corpus builds default to `--days 60 --source all`; `--as-of` freezes the end of the window using a timezone-aware ISO instant. Use `--session-root` to select local directories and `--exclude-session` to omit the active evaluation chat and its forks. The benchmark and sibling inventory retain included sources, duplicates, exclusions, preparation errors, and readiness. No persistent collector is installed. The configured compiler receives normalized user/assistant messages from selected sessions; the candidate receives only task briefs and preserved inputs, and the judge receives criteria and relevant evidence.
 
+Compressed `.jsonl.zst` logs are supported when the optional `zstd` executable is available; decoded data is capped at 64 MiB. Before marking goals incomplete, inspect their raw tool results for genuine historical inputs. Normalized messages do not include tool evidence. Preserve source dates, pagination, and truncation, and keep original answers out of candidate inputs.
+
 Review the distilled goals and source coverage before running the ready subset. Collapse equivalent recurring goals without erasing materially different inputs. Keep unsupported and incomplete goals visible when reporting coverage. A corpus build without a compiler is a preparation draft with one fallback task per session, not a finished evaluation. Freeze the curated benchmark and judge before comparing setups.
 
 ## Make a benchmark from a selected session

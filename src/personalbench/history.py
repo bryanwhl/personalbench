@@ -8,9 +8,10 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from .imports import MAX_SESSION_BYTES, build_benchmark, import_session
+from .imports import build_benchmark, import_session
 from .privacy import write_json
 from .schema import canonical_hash, validate_benchmark
+from .session_io import read_session_bytes
 
 
 def parse_as_of(value: str | None = None) -> datetime:
@@ -39,27 +40,25 @@ def session_roots(source: str = "all") -> list[Path]:
 
 def _latest_timestamp(path: Path) -> datetime | None:
     """Read recorded activity, including session metadata, without trusting file mtimes."""
-    if path.stat().st_size > MAX_SESSION_BYTES:
-        raise ValueError("Session exceeds the 64 MiB import limit")
     latest = None
-    with path.open(encoding="utf-8") as source:
-        for line_number, line in enumerate(source, 1):
-            if not line.strip():
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"Invalid JSON at session line {line_number}") from exc
-            if not isinstance(row, dict):
-                raise ValueError(f"Expected an object at session line {line_number}")  # noqa: TRY004
-            stamp = row.get("timestamp")
-            if not isinstance(stamp, str):
-                continue
-            try:
-                parsed = parse_as_of(stamp)
-            except ValueError:
-                continue
-            latest = max(latest, parsed) if latest else parsed
+    text = read_session_bytes(path).decode("utf-8")
+    for line_number, line in enumerate(text.split("\n"), 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSON at session line {line_number}") from exc
+        if not isinstance(row, dict):
+            raise ValueError(f"Expected an object at session line {line_number}")  # noqa: TRY004
+        stamp = row.get("timestamp")
+        if not isinstance(stamp, str):
+            continue
+        try:
+            parsed = parse_as_of(stamp)
+        except ValueError:
+            continue
+        latest = max(latest, parsed) if latest else parsed
     return latest
 
 
@@ -86,13 +85,19 @@ def discover_sessions(
     roots = session_roots(source) if roots is None else roots
     excluded = {Path(p).expanduser().resolve() for p in (exclude or [])}
     paths = sorted(
-        {p.resolve() for root in roots for p in Path(root).expanduser().rglob("*.jsonl")}
+        {
+            p.resolve()
+            for root in roots
+            for pattern in ("*.jsonl", "*.jsonl.zst")
+            for p in Path(root).expanduser().rglob(pattern)
+        }
     )
     entries = []
     for path in paths:
         entry = {"path": str(path)}
         try:
             entry["bytes"] = path.stat().st_size
+            entry["compression"] = "zstd" if path.name.endswith(".jsonl.zst") else "none"
             if path in excluded:
                 entry.update(status="excluded", reason="explicit exclusion")
             else:

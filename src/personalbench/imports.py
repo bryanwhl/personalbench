@@ -12,8 +12,7 @@ from pathlib import Path
 
 from personalbench.privacy import assert_no_secrets
 from personalbench.schema import safe_relative, validate_benchmark
-
-MAX_SESSION_BYTES = 64 * 1024 * 1024
+from personalbench.session_io import MAX_SESSION_BYTES, read_session_bytes
 
 
 def _text(value: object) -> str:
@@ -139,11 +138,7 @@ def import_session(path: Path, format: str = "auto") -> dict:
     than producing an apparently complete session from partial content.
     """
     path = Path(path)
-    if path.stat().st_size > MAX_SESSION_BYTES:
-        raise ValueError("Session exceeds the 64 MiB import limit; select a smaller export")
-    raw = path.read_bytes()
-    if len(raw) > MAX_SESSION_BYTES:
-        raise ValueError("Session exceeds the 64 MiB import limit; select a smaller export")
+    raw = read_session_bytes(path, max_bytes=MAX_SESSION_BYTES)
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
