@@ -20,7 +20,6 @@ def session(root, name, stamp, request="Explain a stack", response="Last in firs
         "\n".join(
             json.dumps(row)
             for row in [
-                {"type": "session_meta", "timestamp": stamp, "payload": {"id": name}},
                 {
                     "type": "event_msg",
                     "timestamp": stamp,
@@ -72,7 +71,7 @@ def test_history_deduplicates_transcripts_and_audits_failures(tmp_path):
     first = session(tmp_path, "first.jsonl", "2026-11-25T10:00:00Z")
     second = session(tmp_path, "fork.jsonl", "2026-11-26T10:00:00Z")
     empty = tmp_path / "empty.jsonl"
-    empty.write_text('{"timestamp":"2026-11-25T10:00:00Z","type":"session_meta"}')
+    empty.write_text(json.dumps({"type": "event_msg", "timestamp": "2026-11-25T10:00:00Z"}))
     malformed = tmp_path / "broken.jsonl"
     malformed.write_text("{")
     inventory = discover_sessions(roots=[tmp_path], as_of=NOW)
@@ -160,7 +159,9 @@ def test_as_of_requires_timezone_and_empty_history_remains_explicit():
 def test_cli_keeps_inventory_when_all_sessions_fail(tmp_path):
     root = tmp_path / "sessions"
     root.mkdir()
-    (root / "empty.jsonl").write_text('{"type":"session_meta","timestamp":"2026-11-25T10:00:00Z"}')
+    (root / "empty.jsonl").write_text(
+        json.dumps({"type": "event_msg", "timestamp": "2026-11-25T10:00:00Z"})
+    )
     out = tmp_path / "out.json"
     assert (
         main(
