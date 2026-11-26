@@ -14,6 +14,7 @@ from .engine import evaluate, model_callback
 from .history import build_history, discover_sessions, parse_as_of
 from .privacy import private_directory, read_json, write_json
 from .recovery import extract_evidence
+from .runners import adapter_identity
 from .schema import canonical_hash, validate_config
 
 
@@ -349,6 +350,29 @@ def evaluate_history(
                     "source_benchmark": str(reuse_benchmark),
                     "previous_scoring": previous_scoring,
                     "scoring": benchmark.get("scoring", {}),
+                }
+                manifest.pop("reused_evidence_from", None)
+                reuse_report = reuse_benchmark = None
+                write_json(manifest_path, manifest)
+        if not report_path.exists() and reuse_report is not None:
+            previous = read_json(reuse_report)
+            changed = []
+            for role, config, runtime in (
+                ("candidate", configuration, previous.get("runtime", {})),
+                (
+                    "judge",
+                    judge_config,
+                    previous.get("scoring_policy", {}).get("judge_runtime") or {},
+                ),
+            ):
+                expected = adapter_identity(config)
+                if any(runtime.get(key) != value for key, value in expected.items()):
+                    changed.append(role)
+            if changed:
+                manifest["reuse_skipped"] = {
+                    "reason": "Native adapter or input boundary changed; fresh evidence is required",
+                    "source_report": str(reuse_report),
+                    "roles": changed,
                 }
                 manifest.pop("reused_evidence_from", None)
                 reuse_report = reuse_benchmark = None

@@ -36,11 +36,13 @@ class ReportTests(unittest.TestCase):
             "created_at": payload,
             "scope_note": payload,
             "configuration": {"name": payload, "harness": "fixture"},
+            "runtime": {"input_boundary": payload},
             "summary": {"tasks": [{"task_id": payload, "category": payload}], "method": payload},
             "trials": [
                 {
                     "task_id": payload,
                     "output": payload,
+                    "execution_trace": {"stdout": payload},
                     "grading": {"criteria": [{"id": payload, "evidence": payload}]},
                 }
             ],
@@ -54,6 +56,7 @@ class ReportTests(unittest.TestCase):
         self.assertIn("&lt;script&gt;", rendered)
         self.assertIn("Synthetic fixture", rendered)
         self.assertIn("Content-Security-Policy", rendered)
+        self.assertIn("Native execution trace", rendered)
         self.assertIn("Unavailable", rendered)
 
     def test_recorded_label_and_empty_report(self):

@@ -552,3 +552,58 @@ def test_scoring_contract_change_runs_fresh_without_reusing_incompatible_policy(
     assert result["report"]["task_manifest"][0]["criteria"] == old_criteria
     assert previous_report.read_bytes() == original_report
     assert previous_benchmark.read_bytes() == original_benchmark
+
+
+def test_refresh_discards_native_evidence_from_a_legacy_input_boundary(tmp_path):
+    from personalbench import workflow
+
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    source(sessions)
+    output = tmp_path / "evaluation"
+    kwargs = {
+        "compiler_config": config("compiler"),
+        "judge_config": config("judge"),
+        "roots": [sessions],
+        "as_of": "2026-11-26T20:00:00Z",
+        "allow_unsafe_local": True,
+    }
+    with (
+        patch("personalbench.workflow.model_callback", side_effect=callback),
+        patch("personalbench.engine.model_callback", side_effect=callback),
+        patch("personalbench.engine.run_candidate", side_effect=candidate),
+    ):
+        evaluate_history(output, config("candidate"), **kwargs)
+    original_report = (output / "run/report.json").read_bytes()
+    original_benchmark = (output / "benchmark.json").read_bytes()
+    real_build = workflow.build_history
+
+    def refreshed(*args, **build_kwargs):
+        benchmark = real_build(*args, **build_kwargs)
+        benchmark["tasks"][0]["brief"] += " Use the preserved inputs only."
+        return benchmark
+
+    def boundary(configuration):
+        return (
+            {"input_boundary": "synthetic-confined-v1"}
+            if configuration["name"] == "candidate"
+            else {}
+        )
+
+    with (
+        patch("personalbench.workflow.build_history", side_effect=refreshed),
+        patch("personalbench.workflow.adapter_identity", side_effect=boundary),
+        patch("personalbench.workflow.model_callback", side_effect=callback),
+        patch("personalbench.engine.model_callback", side_effect=callback),
+        patch("personalbench.engine.run_candidate", side_effect=candidate) as invoked,
+    ):
+        result = evaluate_history(
+            output, config("candidate"), resume=True, refresh_preparation=True, **kwargs
+        )
+    assert invoked.call_count == 1
+    assert result["workflow"]["stage"] == "complete"
+    assert result["workflow"]["reuse_skipped"]["roles"] == ["candidate"]
+    assert "input boundary changed" in result["workflow"]["reuse_skipped"]["reason"]
+    assert result["report"].get("reuse") is None
+    assert (output / "run/report.json").read_bytes() == original_report
+    assert (output / "benchmark.json").read_bytes() == original_benchmark

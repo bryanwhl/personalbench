@@ -198,6 +198,13 @@ def render_report(report: dict) -> str:
                 "error",
             )
         }
+        trace = (
+            "<details><summary>Native execution trace</summary><pre>"
+            + _json(trial["execution_trace"])
+            + "</pre></details>"
+            if trial.get("execution_trace")
+            else ""
+        )
         attempts.append(
             f"<details><summary>Attempt {index}: {_escape(trial.get('task_id', ''))} "
             f"· repeat {_escape(trial.get('repeat', 'unknown'))}</summary>"
@@ -205,7 +212,7 @@ def render_report(report: dict) -> str:
             f"Quality: {_percent(grading.get('quality_pct'))}.</p>"
             f"<p>{_escape(grading.get('error', ''))}</p><ul>{''.join(evidence)}</ul>"
             f"<h3>Measurements</h3><pre>{_json(metadata)}</pre>"
-            f"<h3>Candidate output</h3><pre>{_escape(output)}</pre></details>"
+            f"<h3>Candidate output</h3><pre>{_escape(output)}</pre>{trace}</details>"
         )
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -249,5 +256,5 @@ Complete tasks: {_escape(coverage.get("complete_tasks", 0))}/{_escape(coverage.g
 Changes in models, tools, instructions, or budgets compare complete setups.</p></section>
 <section><h2>Attempt evidence</h2>{"".join(attempts) or "<p>No attempts were recorded.</p>"}</section>
 <section><h2>Reproducibility</h2><details><summary>Configuration and evidence identifiers</summary>
-<pre>{_json({"baseline_type": baseline, "benchmark_hash": report.get("benchmark_hash"), "scoring_hash": report.get("scoring_hash"), "configuration": config})}</pre></details></section>
+<pre>{_json({"baseline_type": baseline, "benchmark_hash": report.get("benchmark_hash"), "scoring_hash": report.get("scoring_hash"), "configuration": config, "runtime": report.get("runtime"), "execution": report.get("execution")})}</pre></details></section>
 </main><footer><p class="muted">Local HTML. No remote assets, tracking, or external scripts.</p></footer></body></html>"""

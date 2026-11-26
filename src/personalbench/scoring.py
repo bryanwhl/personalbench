@@ -310,6 +310,11 @@ def compare_reports(reports: list[dict]) -> dict:
         ):
             reasons.append(f"Reports must share the same {key}")
     baseline_types = {report.get("baseline_type") for report in reports}
+    boundaries = {report.get("runtime", {}).get("input_boundary") for report in reports}
+    if len(boundaries) != 1:
+        reasons.append(
+            "Reports must share the same candidate input boundary; legacy unrestricted evidence cannot compare with confined runs"
+        )
     if len(baseline_types) != 1 or not baseline_types <= {"fresh", "recorded"}:
         reasons.append("Recorded and fresh runs are different baseline types")
     metric_reasons: dict[str, list[str]] = {}

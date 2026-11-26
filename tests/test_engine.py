@@ -69,6 +69,39 @@ class ManualClock:
 
 
 class EngineTests(unittest.TestCase):
+    def test_native_boundary_identity_prevents_resuming_unconfined_evidence(self):
+        config = {
+            "name": "Native identity probe",
+            "harness": "codex",
+            "model": "synthetic",
+            "tools": "workspace",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "run"
+            answer = run_candidate(benchmark()["tasks"][0], fixture(), output)
+            with (
+                patch("personalbench.engine.subprocess.run") as version,
+                patch("personalbench.engine.run_candidate", return_value=answer) as candidate,
+            ):
+                version.return_value.stdout = "synthetic-cli-version"
+                first = evaluate(benchmark(), config, output, allow_unsafe_local=True)
+                self.assertEqual(first["runtime"]["input_boundary"], "workspace-minimal-read-v1")
+                self.assertEqual(len(first["runtime"]["implementation_hash"]), 64)
+                self.assertEqual(candidate.call_count, 1)
+                candidate.reset_mock()
+                with (
+                    patch(
+                        "personalbench.engine.adapter_identity",
+                        return_value={
+                            "adapter_version": "legacy",
+                            "input_boundary": "unrestricted",
+                        },
+                    ),
+                    self.assertRaisesRegex(ValueError, "Cannot resume"),
+                ):
+                    evaluate(benchmark(), config, output, resume=True, allow_unsafe_local=True)
+                candidate.assert_not_called()
+
     def test_corpus_inventory_survives_evaluation_and_report(self):
         bench = benchmark()
         bench["history"] = {

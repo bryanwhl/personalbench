@@ -14,7 +14,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event
 
-from .imports import build_benchmark, import_session
+from .imports import _text, _user_text, build_benchmark, import_session
 from .privacy import private_directory, read_json, write_json, write_private
 from .runners import RunnerError, check_cancellation, execution_cancellation
 from .schema import canonical_hash, validate_benchmark
@@ -189,6 +189,7 @@ def _metadata(raw: bytes) -> dict:
             return {
                 "session_id": payload.get("id"),
                 "parent_session_id": spawn.get("parent_thread_id"),
+                "forked_from_id": payload.get("forked_from_id"),
                 "internal_subagent": isinstance(source, dict) and "subagent" in source,
             }
     return {}
@@ -403,6 +404,137 @@ def _record_tokens(raw: bytes) -> list[str]:
     return tokens
 
 
+def _fork_chain(entry, by_id):
+    chain = []
+    identifier = entry.get("session_id")
+    current = entry
+    while identifier and identifier not in chain:
+        chain.append(identifier)
+        identifier = current.get("forked_from_id")
+        current = by_id.get(identifier, {})
+    return chain
+
+
+def _message_lines(raw, messages):
+    """Align normalized Codex messages with frozen record order, never timestamp ties."""
+    rows = _records(raw)
+    response_messages = any(
+        row.get("type") == "response_item"
+        and isinstance(row.get("payload"), dict)
+        and row["payload"].get("type") == "message"
+        and row["payload"].get("role") in {"user", "assistant"}
+        for row in rows
+    )
+    lines = []
+    for line, row in enumerate(rows, 1):
+        payload = row.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+        role, text = None, ""
+        if row.get("type") == "response_item" and payload.get("type") == "message":
+            role, text = payload.get("role"), _text(payload.get("content"))
+        elif (
+            row.get("type") == "event_msg"
+            and not response_messages
+            and payload.get("type") in {"user_message", "agent_message"}
+        ):
+            role = "user" if payload["type"] == "user_message" else "assistant"
+            text = _text(payload.get("message"))
+        if role == "user":
+            text = _user_text(text)
+        if len(lines) < len(messages):
+            expected = messages[len(lines)]
+            if (
+                role == expected["role"]
+                and text == expected["text"]
+                and row.get("timestamp") == expected.get("timestamp")
+            ):
+                lines.append(line)
+    return lines if len(lines) == len(messages) else []
+
+
+def _inherited_goal_proof(task, session):
+    """Fingerprint exact copied goal context and its underlying observed inputs.
+
+    Native call identities bind copied source observations even when a fork rewrites
+    serialized timestamps. Different selected-source subsets do not create a new
+    goal when the full available source catalog is demonstrably the same copy.
+    """
+    indices = task.get("provenance", {}).get("source_message_indices")
+    if not indices:
+        return None
+    interval = session["messages"][min(indices) : max(indices) + 1]
+    users = [
+        session["messages"][index]
+        for index in indices
+        if session["messages"][index]["role"] == "user"
+    ]
+    end_dates = [
+        stamp for message in interval if (stamp := _stamp(message.get("timestamp"))) is not None
+    ]
+    if not users or not end_dates:
+        return None
+    lines = session.get("_source_message_lines", [])
+    end_line = lines[max(indices)] if len(lines) == len(session["messages"]) else None
+    observations = []
+    for record in session.get("evidence", {}).get("records", []):
+        output_line = record.get("output_line")
+        if isinstance(output_line, int):
+            if end_line is None:
+                return None
+            if output_line > end_line:
+                continue
+        stamp = _stamp(record.get("output_timestamp"))
+        if stamp is None or stamp > max(end_dates):
+            continue
+        call = record.get("originating_call_id") or record.get("call_id")
+        if not isinstance(call, str) or not call:
+            return None  # no proof that timestamps refer to the same inherited read
+        observations.append(
+            {
+                "call_id": call,
+                "request_hash": record.get("request_hash"),
+                "text_hash": hashlib.sha256(record.get("text", "").encode()).hexdigest(),
+                **{
+                    key: record.get(key)
+                    for key in (
+                        "query",
+                        "kind",
+                        "kinds",
+                        "available_kinds",
+                        "limits",
+                        "mutation_scope",
+                        "observation_type",
+                        "file_coverage",
+                    )
+                },
+            }
+        )
+    complete_inputs = {
+        key: value
+        for key, value in task.get("inputs", {}).items()
+        if key not in {"sources/observations.json", "sources/coverage.json"}
+    }
+    proof = {
+        "requests_hash": canonical_hash([message["text"] for message in users]),
+        "goal_interval_hash": canonical_hash(
+            [{key: message[key] for key in ("role", "text")} for message in interval]
+        ),
+        "source_observations_hash": canonical_hash(observations),
+        "complete_inputs_hash": canonical_hash(complete_inputs),
+        "source_observation_count": len(observations),
+    }
+    # Without shared native reads there is no basis for treating capture-time changes
+    # as a fork serialization artifact rather than materially different starting state.
+    if not observations:
+        proof["source_free_timestamps"] = [message.get("timestamp") for message in interval]
+    if _DYNAMIC.search("\n".join(message["text"] for message in users)):
+        recovery = task.get("provenance", {}).get("recovery", {})
+        proof["local_day"] = recovery.get("target_date")
+        proof["timezone"] = recovery.get("timezone")
+    return proof
+
+
 def _compiler_semantics(identity):
     """Recovery/transport changes revalidate cached model decisions, not resubmit them."""
     if not isinstance(identity, dict):
@@ -538,6 +670,7 @@ def _build_history(
     prepare_session,
 ):
     tasks, seen_content, seen_tasks = [], {}, {}
+    inherited_tasks = {}
     candidates = []
     # Previously completed inventory rows can be restored from immutable cache records.
     for entry in inventory["sessions"]:
@@ -555,8 +688,10 @@ def _build_history(
         stage = "integrity"
         try:
             path, raw = _frozen_source(entry, inventory, artifact_dir)
+            entry.update(_metadata(raw))
             stage = "import"
             session = _normalize(raw)
+            session["_source_message_lines"] = _message_lines(raw, session["messages"])
             stage = "preparation"
             if prepare_session is not None:
                 session = prepare_session(session, path)
@@ -812,11 +947,16 @@ def _build_history(
         raise
     else:
         pool.shutdown(wait=True)
-    # Stable source order makes task identifiers and consolidation reproducible.
+    # Explicit ancestor definitions precede copied descendants; inventory order is
+    # the stable tie-breaker within each depth.
     order = {entry["path"]: index for index, entry in enumerate(inventory["sessions"])}
+    by_id = {
+        entry["session_id"]: entry for entry in inventory["sessions"] if entry.get("session_id")
+    }
     scoring = None
     for (entry, session, _), compiled, error in sorted(
-        results, key=lambda result: order[result[0][0]["path"]]
+        results,
+        key=lambda result: (len(_fork_chain(result[0][0], by_id)), order[result[0][0]["path"]]),
     ):
         if error:
             continue
@@ -859,6 +999,61 @@ def _build_history(
                 task["provenance"].setdefault("warnings", []).append(
                     "Goal user activity cannot be dated within the history window."
                 )
+            fork_chain = _fork_chain(entry, by_id)
+            fork_proof = _inherited_goal_proof(task, session)
+            fork_key = canonical_hash(fork_proof) if fork_proof is not None else None
+            inherited = next(
+                (
+                    candidate
+                    for candidate in inherited_tasks.get(fork_key, [])
+                    if entry.get("session_id") != candidate[1].get("session_id")
+                    and set(fork_chain) & set(_fork_chain(candidate[1], by_id))
+                ),
+                None,
+            )
+            if inherited is not None:
+                original, original_entry = inherited
+                alternate = (
+                    artifact_dir
+                    / "duplicates"
+                    / f"{entry['source_digest']}.{canonical_hash(task)}.json"
+                )
+                detail = {
+                    "retained_task_id": original["id"],
+                    "source_path": entry["path"],
+                    "source_snapshot": entry.get("snapshot_path"),
+                    "method": "explicit-fork-exact-goal-copy",
+                    "proof": fork_proof,
+                    "fork_lineage": fork_chain,
+                    "retained_lineage": _fork_chain(original_entry, by_id),
+                    "alternate_compiled_definition": task,
+                }
+                _write_immutable(
+                    alternate,
+                    (
+                        json.dumps(detail, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
+                    ).encode(),
+                )
+                entry["duplicate_tasks"].append(
+                    {
+                        "source_task_id": task["id"],
+                        "duplicate_of": original["id"],
+                        "method": detail["method"],
+                        "proof": fork_proof,
+                        "alternate_definition": str(alternate.absolute()),
+                    }
+                )
+                original["provenance"].setdefault("duplicate_sources", []).append(
+                    {
+                        "source_path": entry["path"],
+                        "source_digest": entry["source_digest"],
+                        "source_message_indices": indices,
+                        "method": detail["method"],
+                        "proof": fork_proof,
+                        "alternate_definition": str(alternate.absolute()),
+                    }
+                )
+                continue
             dynamic_dates = (
                 [message.get("timestamp") for message in users]
                 if _DYNAMIC.search("\n".join(message["text"] for message in users))
@@ -916,6 +1111,8 @@ def _build_history(
             tasks.append(task)
             entry["task_ids"].append(task["id"])
             seen_tasks[exact] = task
+            if fork_key is not None:
+                inherited_tasks.setdefault(fork_key, []).append((task, entry))
             if mapped_key:
                 seen_tasks[mapped_key] = task
         if not entry["task_ids"] and not entry["duplicate_tasks"]:

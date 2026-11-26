@@ -22,6 +22,20 @@ def trial(tid, *, quality=100, success=True, repeat=0, **extra):
 
 
 class ScoringTests(unittest.TestCase):
+    def test_legacy_and_confined_input_boundaries_cannot_compare(self):
+        report = {
+            "benchmark_hash": "same-benchmark",
+            "scoring_hash": "same-scoring",
+            "baseline_type": "fresh",
+            "runtime": {},
+            "summary": summarize({"tasks": [task("a")]}, [trial("a")]),
+        }
+        confined = copy.deepcopy(report)
+        confined["runtime"]["input_boundary"] = "workspace-minimal-read-v1"
+        result = compare_reports([report, confined])
+        self.assertFalse(result["comparable"])
+        self.assertTrue(any("input boundary" in reason for reason in result["reasons"]))
+
     def test_equal_task_weights_and_bounded_reference_ratios(self):
         benchmark = {"tasks": [task("a"), task("b")]}
         summary = summarize(

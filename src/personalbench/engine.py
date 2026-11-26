@@ -22,7 +22,7 @@ from .implementation import implementation_sources, migrate_comparison_only_poli
 from .privacy import assert_no_secrets, private_directory, read_json, write_json, write_private
 from .report import render_report
 from .reuse import reuse_revision_evidence
-from .runners import RunnerError, execution_cancellation, run_candidate
+from .runners import RunnerError, adapter_identity, execution_cancellation, run_candidate
 from .schema import canonical_hash, safe_relative, validate_benchmark, validate_config
 from .scoring import summarize
 
@@ -36,7 +36,7 @@ def _version(config):
         ).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         value = "unavailable"
-    return {"harness": config["harness"], "version": value}
+    return {"harness": config["harness"], "version": value, **adapter_identity(config)}
 
 
 def model_callback(config, *, allow_unsafe_local=False, calls=None, deadline=None):

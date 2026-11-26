@@ -928,3 +928,174 @@ def test_history_success_policy_is_post_cache_and_requires_no_recompilation(tmp_
     second = build_history(inventory, compiler=no_paid_call, resume=True, **kwargs)
     assert second["tasks"][0]["criteria"] == first_task["criteria"]
     assert len([c for c in second["tasks"][0]["criteria"] if c.get("critical")]) == 1
+
+
+def fork_goal_fixture(
+    tmp_path,
+    *,
+    related=True,
+    source_change=None,
+    different_files=False,
+    different_requirements=False,
+    different_context=False,
+    later_snapshots=False,
+):
+    from personalbench.session_io import read_session_bytes
+
+    logs = tmp_path / "logs"
+    request = "Initialize a private repository and commit and push updates automatically."
+    for name, stamp, identifier in [
+        ("parent.jsonl", "2026-11-25T10:00:00Z", "parent"),
+        ("child.jsonl", "2026-11-25T11:00:00Z", "child"),
+    ]:
+        child = identifier == "child"
+        path = session(
+            logs,
+            name,
+            stamp,
+            request + (" Use a different root folder." if child and different_requirements else ""),
+            "A different accepted implementation plan."
+            if child and different_context
+            else "Initialized and synchronized.",
+        )
+        metadata = {
+            "payload": {
+                "id": identifier,
+                "source": "vscode",
+                "forked_from_id": "parent" if identifier == "child" and related else None,
+            }
+        }
+        metadata["type"] = "session_meta"
+        path.write_text(json.dumps(metadata) + "\n" + path.read_text())
+
+    def prepare(value, snapshot):
+        metadata = json.loads(read_session_bytes(snapshot).decode().split("\n")[0])["payload"]
+        child = metadata["id"] == "child"
+        date = value["messages"][0]["timestamp"]
+        value["evidence"] = {
+            "timezone": "UTC",
+            "records": [
+                {
+                    "id": f"source-{number}",
+                    "call_id": f"copied-call-{number}"
+                    + ("-new" if child and source_change == "call" else ""),
+                    "originating_call_id": f"copied-call-{number}"
+                    + ("-new" if child and source_change == "call" else ""),
+                    "request_hash": f"identical-request-{number}",
+                    "kinds": ["file"],
+                    "available_kinds": ["file"],
+                    "timestamp": date,
+                    "output_timestamp": date,
+                    "query": {},
+                    "limits": [],
+                    "text": f"Recorded directory listing {number}"
+                    + (" changed" if child and source_change == "text" else ""),
+                    "text_hash": f"synthetic-hash-{number}",
+                }
+                for number in (1, 2)
+            ],
+        }
+        if later_snapshots:
+            for record in value["evidence"]["records"]:
+                record["output_line"] = 2
+            value["evidence"]["records"].append(
+                {
+                    "id": "later-source",
+                    "call_id": "later-" + metadata["id"],
+                    "request_hash": "later-request",
+                    "available_kinds": ["file"],
+                    "kinds": ["file"],
+                    "output_line": 4,
+                    "output_timestamp": date,
+                    "timestamp": date,
+                    "text": "Different later state in " + metadata["id"],
+                    "query": {},
+                    "limits": [],
+                }
+            )
+        if different_files:
+            value["inputs"] = {"starting.txt": "child state" if child else "parent state"}
+        return value
+
+    def compile_fork(prompt):
+        child = "2026-11-25T11:00:00Z" in prompt
+        return json.dumps(
+            {
+                "tasks": [
+                    {
+                        "id": "initialize",
+                        "category": "coding",
+                        "requires_starting_state": True,
+                        "brief": "Set up the private repository."
+                        if child
+                        else "Initialize the private repository.",
+                        "criteria": [
+                            {
+                                "id": "created",
+                                "description": "Private remote exists and syncs."
+                                if child
+                                else "Repository is private and synchronized.",
+                            }
+                        ],
+                        "source_message_indices": [0, 1],
+                        "source_evidence_ids": ["source-1", "source-2"] if child else ["source-1"],
+                        "required_evidence_kinds": ["file"],
+                        "execution_requirements": ["workspace", "publication"],
+                    }
+                ],
+                "exclusions": [],
+            }
+        )
+
+    inventory = discover_sessions(roots=[logs], as_of=NOW, snapshot_dir=tmp_path / "snapshots")
+    result = build_history(
+        inventory,
+        compiler=compile_fork,
+        compiler_identity="synthetic",
+        artifact_dir=tmp_path / "artifacts",
+        prepare_session=prepare,
+    )
+    return result, inventory
+
+
+def test_exact_inherited_fork_goal_consolidates_compiler_selection_variation(tmp_path):
+    result, inventory = fork_goal_fixture(tmp_path)
+    assert len(result["tasks"]) == 1
+    task = result["tasks"][0]
+    assert task["brief"] == "Initialize the private repository."
+    assert task["provenance"]["source_evidence_ids"] == ["source-1"]
+    child = next(row for row in inventory["sessions"] if row["session_id"] == "child")
+    duplicate = child["duplicate_tasks"][0]
+    assert duplicate["method"] == "explicit-fork-exact-goal-copy"
+    assert duplicate["duplicate_of"] == task["id"]
+    alternate = json.loads(Path(duplicate["alternate_definition"]).read_text())
+    assert alternate["alternate_compiled_definition"]["brief"] == "Set up the private repository."
+    assert alternate["alternate_compiled_definition"]["provenance"]["source_evidence_ids"] == [
+        "source-1",
+        "source-2",
+    ]
+    assert alternate["proof"]["source_observation_count"] == 2
+    assert {row["status"] for row in inventory["sessions"]} == {"compiled"}
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"related": False},
+        {"source_change": "text"},
+        {"source_change": "call"},
+        {"different_files": True},
+        {"different_requirements": True},
+        {"different_context": True},
+    ],
+)
+def test_inherited_goal_dedup_requires_lineage_identical_observations_and_files(tmp_path, kwargs):
+    result, _ = fork_goal_fixture(tmp_path, **kwargs)
+    assert len(result["tasks"]) == 2
+
+
+def test_fork_goal_source_scope_uses_record_order_when_timestamps_are_tied(tmp_path):
+    result, inventory = fork_goal_fixture(tmp_path, later_snapshots=True)
+    assert len(result["tasks"]) == 1
+    child = next(row for row in inventory["sessions"] if row["session_id"] == "child")
+    assert child["duplicate_tasks"][0]["proof"]["source_observation_count"] == 2

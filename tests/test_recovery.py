@@ -6,6 +6,9 @@ import pytest
 
 from personalbench.recovery import evidence_catalog, extract_evidence, recover_task_inputs
 
+# Synthetic platform path, assembled to keep the publication scanner strict.
+MAC_HOME = "/" + "Users" + "/example"
+
 
 def row(kind, **payload):
     return {
@@ -682,3 +685,295 @@ def test_only_actual_user_invocation_preserves_local_skill_source(tmp_path, invo
         assert task["inputs"]["writing_quality.md"] == content
     else:
         assert evidence["records"] == []
+
+
+def scoped_state_rows():
+    """Earlier implementation, then an independent question about the running service."""
+    rows = call(
+        "exec",
+        {"cmd": "cat original.ts"},
+        {"output": "export const old = 1;", "exit_code": 0},
+        "old",
+    )
+    rows += [row("message", role="user", content=[{"type": "input_text", "text": "Build the bot"}])]
+    rows += call("exec", {"cmd": "touch generated.ts"}, {"output": ""}, "write")
+    rows += [
+        row(
+            "message",
+            role="assistant",
+            content=[{"type": "output_text", "text": "PRIVATE SOLUTION"}],
+        )
+    ]
+    rows += [
+        row(
+            "message",
+            role="user",
+            content=[{"type": "input_text", "text": "Does the running bot use my subscription?"}],
+        )
+    ]
+    rows += call(
+        "exec",
+        {
+            "cmd": "docker compose exec -T bot codex login status\nrg -n 'spawn|login' src/agent.ts config/codex.toml docs/decisions.md"
+        },
+        {
+            "exit_code": 0,
+            "output": 'Logged in using ChatGPT\nsrc/agent.ts:3:spawn("codex", ["app-server"])\nconfig/codex.toml:1:forced_login_method = "chatgpt"\ndocs/decisions.md:2:PRIVATE PRIOR NARRATIVE',
+        },
+        "runtime",
+    )
+    rows += call(
+        "web.run",
+        {"search_query": [{"q": "official auth docs"}]},
+        {"text": "Official source"},
+        "web",
+    )
+    for index, value in enumerate(rows):
+        value["timestamp"] = f"2026-11-26T15:{index:02}:00Z"
+    return rows
+
+
+def test_independent_later_goal_can_use_readonly_runtime_state_without_prior_solution(tmp_path):
+    rows = scoped_state_rows()
+    evidence = extract_evidence(write_log(tmp_path, rows))
+    assert [record["id"] for record in evidence["records"] if not record.get("mutation_scope")] == [
+        "source-0001",
+        "source-0002",
+    ]
+    state = next(record for record in evidence["records"] if record.get("mutation_scope"))
+    assert state["id"].startswith("state-source-")
+    assert state["observation_type"] == "read_only_runtime_status"
+    assert "PRIVATE PRIOR NARRATIVE" not in state["text"]
+    messages = [
+        {
+            "role": "user",
+            "text": "Does the running bot use my subscription?",
+            "timestamp": rows[6]["timestamp"],
+        },
+        {"role": "assistant", "text": "PRIVATE SOLUTION", "timestamp": "2026-11-26T16:00:00Z"},
+    ]
+    task = recover_task_inputs(
+        goal(
+            brief="Explain bot subscription authentication",
+            source_evidence_ids=[state["id"]],
+            required_evidence_kinds=["file"],
+        ),
+        evidence,
+        messages,
+    )
+    assert task["readiness"] == "ready"
+    assert "Logged in using ChatGPT" in json.dumps(task["inputs"])
+    assert "PRIVATE SOLUTION" not in json.dumps(task["inputs"])
+    assert {
+        key: value for key, value in state["mutation_scope"].items() if key != "line"
+    } == json.loads(task["inputs"]["sources/observations.json"])["records"][0]["mutation_scope"]
+    assert "mutation_scope" not in evidence_catalog(evidence)[0]
+
+
+def test_same_goal_cannot_use_its_generated_source_despite_later_followup(tmp_path):
+    rows = scoped_state_rows()
+    evidence = extract_evidence(write_log(tmp_path, rows))
+    state = next(record for record in evidence["records"] if record.get("mutation_scope"))
+    messages = [
+        {"role": "user", "text": "Build the bot", "timestamp": rows[2]["timestamp"]},
+        {"role": "user", "text": "Does it use my subscription?", "timestamp": rows[6]["timestamp"]},
+        {"role": "assistant", "text": "Done", "timestamp": "2026-11-26T16:00:00Z"},
+    ]
+    task = recover_task_inputs(
+        goal(
+            brief="Build bot and explain authentication",
+            source_evidence_ids=[state["id"]],
+            required_evidence_kinds=["file"],
+            provenance={"source_message_indices": [0, 1, 2]},
+        ),
+        evidence,
+        messages,
+    )
+    assert task["readiness"] == "incomplete"
+    assert task["provenance"]["recovery"]["accepted_ids"] == []
+    assert "same mapped goal" in task["provenance"]["recovery"]["excluded"][0]["reason"]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat docs/answer.md",
+        "cat memory.md",
+        "cat auth.json",
+        "cat .env",
+        "docker compose stop\ndocker compose ps",
+        "node verify.ts\ndocker compose ps",
+        "cat src/agent.ts; touch generated.ts",
+        "cat src/agent.ts docs/answer.md",
+    ],
+)
+def test_later_goal_recovery_never_includes_credentials_narratives_or_mutating_mixed_calls(
+    tmp_path, command
+):
+    rows = scoped_state_rows()[:7]
+    rows += call("exec", {"cmd": command}, {"output": "PRIVATE GENERATED MATERIAL"}, "excluded")
+    for value in rows[7:]:
+        value["timestamp"] = "2026-11-26T15:20:00Z"
+    evidence = extract_evidence(write_log(tmp_path, rows))
+    assert "PRIVATE GENERATED MATERIAL" not in json.dumps(evidence["records"])
+
+
+def test_later_source_inspection_requires_a_readonly_question_not_an_implementation_continuation(
+    tmp_path,
+):
+    rows = scoped_state_rows()[:7]
+    rows[-1]["payload"]["content"][0]["text"] = "Use the existing exports instead"
+    rows += call(
+        "exec",
+        {"cmd": "cat src/agent.ts"},
+        {"exit_code": 0, "output": "PRIVATE SAME-GOAL IMPLEMENTATION"},
+        "continued",
+    )
+    for value in rows[7:]:
+        value["timestamp"] = "2026-11-26T15:20:00Z"
+    evidence = extract_evidence(write_log(tmp_path, rows))
+    assert "PRIVATE SAME-GOAL IMPLEMENTATION" not in json.dumps(evidence["records"])
+
+
+def test_later_inspection_does_not_expose_uninvoked_skill_helper_code(tmp_path):
+    rows = scoped_state_rows()[:7]
+    rows += call(
+        "exec",
+        {"cmd": "cat " + MAC_HOME + "/.codex/skills/example/helper.ts"},
+        {"exit_code": 0, "output": "PRIVATE HELPER INSTRUCTIONS"},
+        "helper",
+    )
+    for value in rows[7:]:
+        value["timestamp"] = "2026-11-26T15:20:00Z"
+    evidence = extract_evidence(write_log(tmp_path, rows))
+    assert "PRIVATE HELPER INSTRUCTIONS" not in json.dumps(evidence["records"])
+
+
+def test_historical_calendar_search_name_recovers_successful_empty_calendars(tmp_path):
+    rows = call(
+        "exec",
+        {"unused": "unused"},
+        {},
+        "legacy",
+    )
+    rows[0]["payload"]["arguments"] = (
+        'const results = await Promise.all([tools.mcp__codex_apps__google_calendar_search({time_min:"2026-11-26T00:00:00-08:00",time_max:"2026-11-27T00:00:00-08:00"}), tools.mcp__codex_apps__gmail_search_emails({query:"is:unread"})]); text(JSON.stringify(results));'
+    )
+    rows[1]["payload"]["output"] = json.dumps(
+        {
+            "calResults": [
+                {"structuredContent": {"events": [], "next_page_token": None}, "isError": False}
+            ],
+            "emails": [],
+        }
+    )
+    evidence = extract_evidence(write_log(tmp_path, rows))
+    assert evidence["records"][0]["available_kinds"] == ["calendar", "email"]
+    result = recover_task_inputs(goal(source_evidence_ids=["source-0001"]), evidence, MESSAGES)
+    assert result["readiness"] == "ready"
+    assert result["provenance"]["recovery"]["missing_kinds"] == []
+
+
+def test_unparseable_mutation_time_cannot_establish_later_goal_starting_state(tmp_path):
+    rows = scoped_state_rows()
+    rows[3]["timestamp"] = "unknown historical time"
+    evidence = extract_evidence(write_log(tmp_path, rows))
+    assert not any(record.get("mutation_scope") for record in evidence["records"])
+
+
+def test_candidate_inputs_withhold_raw_log_locators_but_keep_private_audit_and_task_paths(tmp_path):
+    evidence = extract_evidence(write_log(tmp_path, call("web.run", {}, {"text": "Official docs"})))
+    private_path = "/private/RAW_LOG_CANARY/frozen-session.jsonl"
+    private_digest = "PRIVATE_RAW_DIGEST_CANARY"
+    evidence.update(source_path=private_path, source_digest=private_digest)
+    record = evidence["records"][0]
+    code_path = MAC_HOME + "/project/src/agent.ts"
+    document_url = "https://example.com/reference"
+    record["query"] = {"path": code_path, "url": document_url}
+    record["text"] = (
+        f"Source code at {code_path}; reference {document_url}; private archive {private_path}; digest {private_digest}"
+    )
+    task = recover_task_inputs(
+        goal(
+            brief="Explain the source behavior",
+            source_evidence_ids=[record["id"]],
+            required_evidence_kinds=["web"],
+            inputs={
+                "request.txt": "Automation memory: "
+                + MAC_HOME
+                + "/.codex/automations/daily/memory.md\nArchived chat: "
+                + MAC_HOME
+                + "/.codex/sessions/2026/old-session.jsonl\nSource file: "
+                + code_path
+            },
+        ),
+        evidence,
+        MESSAGES,
+    )
+    candidate = json.dumps(task["inputs"])
+    assert private_path not in candidate
+    assert private_digest not in candidate
+    assert "frozen-session.jsonl" not in candidate
+    assert ".codex/sessions/" not in candidate
+    assert ".codex/automations/" not in candidate
+    assert "source_path" not in task["inputs"]["sources/coverage.json"]
+    assert "source_digest" not in task["inputs"]["sources/coverage.json"]
+    assert code_path in candidate
+    assert document_url in candidate
+    assert task["provenance"]["recovery"]["source_path"] == private_path
+    assert task["provenance"]["recovery"]["source_digest"] == private_digest
+    assert evidence["records"][0]["text"].endswith(private_digest)
+
+
+@pytest.mark.parametrize(
+    "pointer",
+    [
+        MAC_HOME + "/.codex/sessions/2026/rollout-secret.jsonl",
+        MAC_HOME + "/.codex/archived_sessions/rollout-secret.jsonl",
+        r"C:\Users\example\.codex\sessions\rollout-secret.jsonl",
+        "~/.codex/automations/daily/memory.md",
+        "codex://threads/private-thread-canary",
+        "/project/.personalbench/full-60d/sources/private-other-session.jsonl",
+    ],
+)
+def test_other_private_session_lookup_pointers_are_removed_from_source_data(tmp_path, pointer):
+    evidence = extract_evidence(write_log(tmp_path, call("web.run", {}, {"text": "Official docs"})))
+    record = evidence["records"][0]
+    record["text"] = f"Source URL https://example.com; unavailable archive {pointer}"
+    record["query"] = {"path": pointer}
+    result = recover_task_inputs(
+        goal(
+            brief="Explain source",
+            source_evidence_ids=[record["id"]],
+            required_evidence_kinds=["web"],
+        ),
+        evidence,
+        MESSAGES,
+    )
+    candidate = json.dumps(result["inputs"])
+    assert pointer not in candidate
+    assert "private-thread-canary" not in candidate
+    assert "private-other-session.jsonl" not in candidate
+    assert "rollout-secret.jsonl" not in candidate
+    assert "https://example.com" in candidate
+    assert pointer in record["text"]
+
+
+def test_public_document_urls_and_coding_workspace_paths_are_not_private_archive_locators(tmp_path):
+    evidence = extract_evidence(write_log(tmp_path, call("web.run", {}, {"text": "Official docs"})))
+    paths = [
+        "https://example.com/docs/.codex/sessions/format",
+        "/project/.codex/custom/source.py",
+        "/project/src/session_io.py",
+    ]
+    evidence["records"][0]["text"] = "\n".join(paths)
+    result = recover_task_inputs(
+        goal(
+            brief="Explain source",
+            source_evidence_ids=["source-0001"],
+            required_evidence_kinds=["web"],
+        ),
+        evidence,
+        MESSAGES,
+    )
+    assert all(path in json.dumps(result["inputs"]) for path in paths)
