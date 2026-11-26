@@ -35,7 +35,7 @@ Open `.personalbench/demo/report.html` in your browser. The fixture adapter retu
 
 ## Evaluate your recent work (default)
 
-An unqualified Personalbench run uses the past **60 days** of available local Codex and Claude sessions. Distill the whole window into independent goals, consolidate equivalent fork histories and repeated tasks, and keep coverage across projects and task types. Missing historical files or connected sources remain explicit gaps; a transcript alone does not make a task replayable.
+An unqualified Personalbench run uses the past **60 days** of available local Codex and Claude sessions. Distill the whole window into independent goals, consolidate equivalent fork histories and repeated tasks, and keep coverage across projects and task types. Independent goals with no user request or clarification inside the window are excluded; earlier messages remain context for recent goals. Missing historical files or connected sources remain explicit gaps; a transcript alone does not make a task replayable.
 
 ```bash
 personalbench sessions

@@ -161,9 +161,46 @@ def build_history(
                 write_json(compiled_path, benchmark)
                 entry["compiled_benchmark"] = str(compiled_path)
             entry["duplicate_tasks"] = []
+            entry["excluded_tasks"] = []
             task_ids = []
             scoring = benchmark["scoring"]
             for task in benchmark["tasks"]:
+                indices = task["provenance"].get("source_message_indices")
+                mapped = (
+                    [session["messages"][index] for index in indices]
+                    if indices is not None
+                    else session["messages"]
+                    if len(benchmark["tasks"]) == 1
+                    else []
+                )
+                user_dates = []
+                for message in mapped:
+                    if message["role"] == "user" and message.get("timestamp"):
+                        try:
+                            user_dates.append(parse_as_of(message["timestamp"]))
+                        except ValueError:
+                            pass
+                if (
+                    user_dates
+                    and inventory.get("since")
+                    and not any(
+                        parse_as_of(inventory["since"]) <= stamp <= parse_as_of(inventory["as_of"])
+                        for stamp in user_dates
+                    )
+                ):
+                    entry["excluded_tasks"].append(
+                        {
+                            "source_task_id": task["id"],
+                            "reason": "No mapped user request or clarification in history window",
+                            "last_user_activity": max(user_dates).isoformat(),
+                        }
+                    )
+                    continue
+                if not user_dates:
+                    task["readiness"] = "incomplete"
+                    task["provenance"]["warnings"].append(
+                        "Goal user activity cannot be dated within the history window."
+                    )
                 task_digest = canonical_hash(
                     {key: task.get(key) for key in ("brief", "inputs", "criteria", "category")}
                 )

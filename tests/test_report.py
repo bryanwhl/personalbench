@@ -20,6 +20,7 @@ class ReportTests(unittest.TestCase):
         payload = '<script>alert("oops")</script><img src="https://example.com/x">'
         report = {
             "created_at": payload,
+            "scope_note": payload,
             "configuration": {"name": payload, "harness": "fixture"},
             "summary": {"tasks": [{"task_id": payload, "category": payload}], "method": payload},
             "trials": [

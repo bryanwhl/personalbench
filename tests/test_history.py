@@ -182,3 +182,43 @@ def test_cli_explicit_session_overrides_corpus_discovery(tmp_path):
     assert len(result["tasks"]) == 1
     assert "Explain queues" in result["tasks"][0]["brief"]
     assert "history" not in result
+
+
+def test_old_goals_in_resumed_session_are_context_not_recent_tasks(tmp_path):
+    path = session(tmp_path, "resumed.jsonl", "2026-08-01T10:00:00Z", "Explain stack")
+    with path.open("a") as stream:
+        for row in [
+            {
+                "type": "event_msg",
+                "timestamp": "2026-11-25T10:00:00Z",
+                "payload": {"type": "user_message", "message": "Explain queue"},
+            },
+            {
+                "type": "event_msg",
+                "timestamp": "2026-11-25T10:00:01Z",
+                "payload": {"type": "agent_message", "message": "First in first out"},
+            },
+        ]:
+            stream.write("\n" + json.dumps(row))
+
+    def split(prompt):
+        assert "Explain stack" in prompt  # earlier context is available to the compiler
+        return json.dumps(
+            {
+                "tasks": [
+                    {
+                        "id": name,
+                        "brief": "Explain " + name,
+                        "requires_starting_state": False,
+                        "source_message_indices": indices,
+                        "criteria": [{"id": "ok", "description": "Accurate explanation"}],
+                    }
+                    for name, indices in [("stack", [0, 1]), ("queue", [2, 3])]
+                ]
+            }
+        )
+
+    result = build_history(discover_sessions(roots=[tmp_path], as_of=NOW), compiler=split)
+    assert len(result["tasks"]) == 1
+    assert result["tasks"][0]["brief"] == "Explain queue"
+    assert result["history"]["sessions"][0]["excluded_tasks"][0]["source_task_id"] == "stack"

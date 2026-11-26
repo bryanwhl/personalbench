@@ -36,6 +36,9 @@ def render_report(report: dict) -> str:
         if baseline == "recorded"
         else "Fresh run. Results describe this complete setup on these tasks, tools, and budgets."
     )
+    scope_notice = (
+        f'<p class="notice">{_escape(report["scope_note"])}</p>' if report.get("scope_note") else ""
+    )
     cards = "".join(
         f'<div class="metric"><span>{label}</span><strong>{_percent(summary.get(key))}</strong></div>'
         for key, label in (
@@ -194,7 +197,7 @@ section {{ margin:32px 0; }} @media(max-width:500px) {{ body {{ padding:16px; }}
 @media print {{ body {{ color:#111; background:white; }} .metric,.notice,pre {{ color:#111; background:#eee; }} details {{ break-inside:avoid; }} }}
 </style></head><body><header><p class="muted">PERSONALBENCH · PRIVATE REPORT</p>
 <h1>{_escape(name)}</h1><p>{_escape(report.get("created_at", ""))}</p>
-<p class="notice">{_escape(notice)}</p></header><main>
+<p class="notice">{_escape(notice)}</p>{scope_notice}</header><main>
 <section aria-label="Headline scores"><div class="metrics">{cards}</div>
 <p>Graded trials: {_escape(coverage.get("scored_trials", 0))}/{_escape(coverage.get("expected_trials", 0))}.
 Complete tasks: {_escape(coverage.get("complete_tasks", 0))}/{_escape(coverage.get("total_tasks", 0))}.</p>
