@@ -97,3 +97,9 @@ Local command execution requires the CLI's explicit unsafe-local option. Use a c
 ## Compiled historical goals
 
 The optional compiler receives numbered messages and may return `source_message_indices` for each goal. These sorted, unique, zero-based indices identify the user requests and recorded assistant responses used for that goal. Personalbench validates the mapping and retains its inferred provenance. Aggregate session time, cost, and tokens are not divided across goals without evidence. A transcript's final text may not include the actual files it discusses; recorded grading cannot verify absent artifacts.
+
+## History corpus
+
+`build` without a session and `sessions` use a trailing 60-day window across local Codex sessions (including archives) and Claude projects. Selection uses the latest recorded timezone-aware timestamp, never file modification time. Complete selected transcripts retain earlier context. `--days`, `--as-of`, `--source`, repeatable `--session-root`, and repeatable `--exclude-session` override discovery. A session whose latest activity is after an explicit `--as-of` is excluded as a whole; this conservative selection does not reconstruct an earlier transcript snapshot.
+
+Corpus benchmarks include a `history` inventory with source paths, the frozen window, exclusions, preparation errors, normalized-content digests, duplicates, task mappings, and readiness. The CLI checkpoints the inventory in a sibling `.inventory.json` and normalized/compiled sessions in a sibling `.sessions` directory. Exact equivalent transcripts are deduplicated independently of timestamps; exact compiled task duplicates retain their source mappings. Semantic consolidation of fork goals still requires preparation review. No compiler means incomplete fallback tasks, not an automatically runnable benchmark.

@@ -33,9 +33,23 @@ personalbench report .personalbench/demo/report.json \
 
 Open `.personalbench/demo/report.html` in your browser. The fixture adapter returns predetermined synthetic answers: this demonstrates the workflow and **does not measure any real model**.
 
-## Make your own benchmark
+## Evaluate your recent work (default)
 
-Start with a small session whose goal and starting inputs are available. Codex sessions are commonly stored under `~/.codex/sessions/`; select a particular JSONL file rather than copying the whole directory into this repository.
+An unqualified Personalbench run uses the past **60 days** of available local Codex and Claude sessions. Distill the whole window into independent goals, consolidate equivalent fork histories and repeated tasks, and keep coverage across projects and task types. Missing historical files or connected sources remain explicit gaps; a transcript alone does not make a task replayable.
+
+```bash
+personalbench sessions
+personalbench build --compiler /path/to/compiler.json \
+  --output .personalbench/history/benchmark.json --allow-unsafe-local
+```
+
+`build` without a session discovers the corpus. `sessions` and corpus builds default to `--days 60 --source all`; `--as-of` freezes the end of the window using a timezone-aware ISO instant. Use `--session-root` to select local directories and `--exclude-session` to omit the active evaluation chat and its forks. The benchmark and sibling inventory retain included sources, duplicates, exclusions, preparation errors, and readiness. No persistent collector is installed. The configured compiler receives normalized user/assistant messages from selected sessions; the candidate receives only task briefs and preserved inputs, and the judge receives criteria and relevant evidence.
+
+Review the distilled goals and source coverage before running the ready subset. Collapse equivalent recurring goals without erasing materially different inputs. Keep unsupported and incomplete goals visible when reporting coverage. A corpus build without a compiler is a preparation draft with one fallback task per session, not a finished evaluation. Freeze the curated benchmark and judge before comparing setups.
+
+## Make a benchmark from a selected session
+
+An explicit session or narrower range overrides the default. Codex sessions are commonly stored under `~/.codex/sessions/`.
 
 ```bash
 personalbench sessions

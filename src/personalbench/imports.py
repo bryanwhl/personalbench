@@ -49,6 +49,8 @@ def _user_text(content: str) -> str:
         "user_instructions",
         "in-app-browser-context",
         "INSTRUCTIONS",
+        "recommended_plugins",
+        "skill",
     )
     while True:
         previous = content
@@ -59,8 +61,34 @@ def _user_text(content: str) -> str:
             content = re.sub(pattern, "", content, count=1)
         if content == previous:
             break
+    if content != original and content.lstrip().startswith("# AGENTS.md instructions"):
+        return _user_text(content)
     if content != original and content.lstrip().startswith("## My request:"):
         content = content.lstrip()[len("## My request:") :].lstrip()
+    reply = re.fullmatch(
+        r"\s*<send_user_message_question_reply>\s*([\s\S]*?)\s*"
+        r"</send_user_message_question_reply>\s*",
+        content,
+    )
+    if reply:
+        try:
+            answers = json.loads(reply.group(1))
+        except json.JSONDecodeError:
+            return content
+        if (
+            isinstance(answers, list)
+            and answers
+            and all(
+                isinstance(answer, dict)
+                and isinstance(answer.get("question"), str)
+                and isinstance(answer.get("answer"), str)
+                for answer in answers
+            )
+        ):
+            return "\n\n".join(
+                f"Question: {answer['question']}\nUser answer: {answer['answer']}"
+                for answer in answers
+            )
     return content
 
 
@@ -301,6 +329,12 @@ def build_benchmark(
             "Preserve legitimate clarifications. Do not reveal solution details in briefs. "
             "Do not invent starting files, timings, usage, costs, or accepted outcomes. "
             "Distinguish goals from incidental conversation. Mark requires_starting_state false only for a task fully answerable from its brief. "
+            "Goals requiring calendar/email state, live web sources, local machine inspection, "
+            "existing repositories, or external files are not self-contained when those inputs "
+            "are missing. Do not replace such goals with generic advice or extract a trivial "
+            "subquestion merely to make them runnable. Use categories matching the actual work. "
+            "Combine refinements of the same deliverable into one goal; separate independent "
+            "deliverables. Write concrete outcome criteria grounded in the user requirements. "
             "For each goal, return source_message_indices: the sorted unique source_index values "
             "of the relevant user requests, clarifications, and assistant result messages. "
             "Only select actual recorded messages. Do not invent or rewrite historical outputs. "

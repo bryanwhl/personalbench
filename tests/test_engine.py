@@ -52,6 +52,19 @@ def fixture(ids=("a",)):
 
 
 class EngineTests(unittest.TestCase):
+    def test_corpus_inventory_survives_evaluation_and_report(self):
+        bench = benchmark()
+        bench["history"] = {
+            "days": 60,
+            "sessions": [{"path": "missing.jsonl", "status": "error"}],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "run"
+            result = evaluate(bench, fixture(), output)
+            self.assertEqual(result["history"], bench["history"])
+            self.assertIn("Source coverage", (output / "report.html").read_text())
+            self.assertIn("error: 1", (output / "report.html").read_text())
+
     def test_resume_skips_completed_attempts_and_rejects_changed_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory).resolve() / "run"

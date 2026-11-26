@@ -4,15 +4,16 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import shutil
 import sys
+from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 
 from . import __version__
 from .capture import capture_finish, capture_start, capture_watch
 from .engine import evaluate, model_callback
+from .history import build_history, discover_sessions, parse_as_of
 from .imports import build_benchmark, import_session
 from .privacy import DEFAULT_HOME, read_json, scan_paths, write_json, write_private
 from .report import render_report
@@ -44,6 +45,30 @@ def _model_options(parser):
     )
 
 
+def _history_options(parser):
+    parser.add_argument(
+        "--days", type=int, default=60, help="Trailing history window (default: 60 days)"
+    )
+    parser.add_argument("--as-of", help="ISO timestamp with timezone; default: now")
+    parser.add_argument("--source", choices=["all", "codex", "claude"], default="all")
+    parser.add_argument(
+        "--session-root", action="append", help="Explicit JSONL directory; repeatable"
+    )
+    parser.add_argument(
+        "--exclude-session", action="append", default=[], help="Exclude a session path"
+    )
+
+
+def _discover(args):
+    return discover_sessions(
+        days=args.days,
+        as_of=parse_as_of(args.as_of),
+        source=args.source,
+        roots=[Path(p) for p in args.session_root] if args.session_root else None,
+        exclude=[Path(p) for p in args.exclude_session],
+    )
+
+
 def parser():
     root = argparse.ArgumentParser(prog="personalbench", description="Your work. Your benchmark.")
     root.add_argument("--version", action="version", version=__version__)
@@ -53,7 +78,8 @@ def parser():
     imp.add_argument("--format", choices=["auto", "codex", "claude", "normalized"], default="auto")
     imp.add_argument("--output")
     build = sub.add_parser("build", help="Compile goals and criteria into a benchmark")
-    build.add_argument("session")
+    build.add_argument("session", nargs="?", help="One session; omit for the past 60 days")
+    _history_options(build)
     build.add_argument("--output")
     build.add_argument("--name", default="Personal benchmark")
     build.add_argument(
@@ -107,7 +133,7 @@ def parser():
     scan.add_argument("--git", action="store_true", help="Inspect tracked/staged files only")
     sub.add_parser("doctor", help="Check local prerequisites without reading credentials")
     sessions = sub.add_parser("sessions", help="List local session filenames; never print content")
-    sessions.add_argument("--source", choices=["codex", "claude"], default="codex")
+    _history_options(sessions)
     return root
 
 
@@ -126,7 +152,6 @@ def main(argv=None):
                 }
             )
         elif args.action == "build":
-            session = import_session(Path(args.session).expanduser())
             calls = []
             compiler = (
                 model_callback(
@@ -137,8 +162,31 @@ def main(argv=None):
                 if args.compiler
                 else None
             )
-            benchmark = build_benchmark(session, name=args.name, compiler=compiler)
             output = _destination(args.output, "benchmark.json")
+            if args.session:
+                session = import_session(Path(args.session).expanduser())
+                benchmark = build_benchmark(session, name=args.name, compiler=compiler)
+            else:
+                inventory = _discover(args)
+                inventory_path = output.with_suffix(".inventory.json")
+                write_json(inventory_path, inventory)
+
+                def checkpoint(entry):
+                    write_json(inventory_path, inventory)
+                    if calls:
+                        write_json(output.with_suffix(".preparation.json"), {"calls": calls})
+                    print(
+                        json.dumps({"session": entry["path"], "status": entry["status"]}),
+                        file=sys.stderr,
+                    )
+
+                benchmark = build_history(
+                    inventory,
+                    name=args.name,
+                    compiler=compiler,
+                    progress=checkpoint,
+                    artifact_dir=output.parent / (output.stem + ".sessions"),
+                )
             write_json(output, benchmark)
             if calls:
                 write_json(output.with_suffix(".preparation.json"), {"calls": calls})
@@ -147,6 +195,21 @@ def main(argv=None):
                     "output": str(output),
                     "tasks": len(benchmark["tasks"]),
                     "ready": sum(t.get("readiness") == "ready" for t in benchmark["tasks"]),
+                    "preparation": "model_proposed" if compiler else "fallback_draft",
+                    **(
+                        {
+                            "history": {
+                                "days": inventory["days"],
+                                "as_of": inventory["as_of"],
+                                "sessions": dict(
+                                    Counter(row["status"] for row in inventory["sessions"])
+                                ),
+                                "inventory": str(inventory_path),
+                            }
+                        }
+                        if not args.session
+                        else {}
+                    ),
                 }
             )
         elif args.action == "validate":
@@ -254,27 +317,7 @@ def main(argv=None):
                 }
             )
         elif args.action == "sessions":
-            source = (
-                Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
-                if args.source == "codex"
-                else Path.home() / ".claude"
-            )
-            roots = (
-                [source / "sessions", source / "archived_sessions"]
-                if args.source == "codex"
-                else [source / "projects"]
-            )
-            paths = sorted(
-                (p for r in roots for p in r.rglob("*.jsonl")),
-                key=lambda p: p.stat().st_mtime,
-                reverse=True,
-            )
-            _json(
-                {
-                    "source": args.source,
-                    "sessions": [{"path": str(p), "bytes": p.stat().st_size} for p in paths],
-                }
-            )
+            _json(_discover(args))
         return 0
     except KeyboardInterrupt:
         print(

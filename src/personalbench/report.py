@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 import json
 import math
+from collections import Counter
 
 
 def _escape(value: object) -> str:
@@ -44,6 +45,25 @@ def render_report(report: dict) -> str:
         )
     )
     coverage = summary.get("coverage", {})
+    history = report.get("history")
+    history_section = ""
+    if isinstance(history, dict):
+        counts = Counter(row.get("status", "unknown") for row in history.get("sessions", []))
+        history_section = (
+            "<section><h2>Source coverage</h2><p>History window: "
+            + _escape(history.get("since", "unknown"))
+            + " to "
+            + _escape(history.get("as_of", "unknown"))
+            + ". Source sessions: "
+            + _escape(sum(counts.values()))
+            + ". "
+            + _escape(", ".join(f"{status}: {count}" for status, count in sorted(counts.items())))
+            + ".</p><p>Task scores cover the declared benchmark only. Excluded sources and "
+            "preparation errors do not count as successful tasks.</p>"
+            "<details><summary>Source inventory and preparation decisions</summary><pre>"
+            + _json(history)
+            + "</pre></details></section>"
+        )
     rows = []
     for task in summary.get("tasks", []):
         reliability = task.get("reliability", {})
@@ -179,6 +199,7 @@ section {{ margin:32px 0; }} @media(max-width:500px) {{ body {{ padding:16px; }}
 <p>Graded trials: {_escape(coverage.get("scored_trials", 0))}/{_escape(coverage.get("expected_trials", 0))}.
 Complete tasks: {_escape(coverage.get("complete_tasks", 0))}/{_escape(coverage.get("total_tasks", 0))}.</p>
 <p class="muted">Unavailable means evidence is missing. Missing results never count as passing results.</p></section>
+{history_section}
 <section><h2>Results by task</h2><div class="table-wrap"><table><caption>Tasks have equal weight in the headline scores.</caption>
 <thead><tr><th scope="col">Task</th><th scope="col">Category</th><th scope="col">Quality</th><th scope="col">Success</th><th scope="col">Efficiency</th><th scope="col">Graded repeats</th><th scope="col">Reliability</th></tr></thead>
 <tbody>{"".join(rows)}</tbody></table></div></section>

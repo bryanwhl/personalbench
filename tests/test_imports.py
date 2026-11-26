@@ -300,6 +300,34 @@ def test_user_mentions_of_ambient_tags_are_preserved(tmp_path):
     assert import_session(path)["messages"][0]["text"] == text
 
 
+def test_plugin_and_skill_envelopes_are_not_goals_but_following_requests_survive(tmp_path):
+    rows = [
+        {"type": "event_msg", "payload": {"type": "user_message", "message": text}}
+        for text in [
+            "<recommended_plugins>Installable tools</recommended_plugins>",
+            "<skill><name>example</name>Instructions</skill>\nExplain queues.",
+        ]
+    ]
+    assert [m["text"].strip() for m in import_session(write_rows(tmp_path, rows))["messages"]] == [
+        "Explain queues."
+    ]
+
+
+def test_question_reply_keeps_clarification_without_internal_identifiers(tmp_path):
+    reply = [{"questionItemId": "internal-id", "question": "Which format?", "answer": "HTML"}]
+    text = (
+        "<send_user_message_question_reply>"
+        + json.dumps(reply)
+        + ("</send_user_message_question_reply>")
+    )
+    path = write_rows(
+        tmp_path, [{"type": "event_msg", "payload": {"type": "user_message", "message": text}}]
+    )
+    assert import_session(path)["messages"][0]["text"] == (
+        "Question: Which format?\nUser answer: HTML"
+    )
+
+
 def test_goal_source_indices_map_historical_output_without_inventing_cost():
     session = {
         "messages": [

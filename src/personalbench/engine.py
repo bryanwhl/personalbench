@@ -175,6 +175,8 @@ def _evaluate(
             ],
         }
     effective = dict(benchmark, repeats=repeats)
+    if "history" in benchmark:
+        report["history"] = benchmark["history"]
     started = time.monotonic()
     previous_elapsed = report.get("elapsed_seconds", 0)
     deadline = started + max(0, max_total_seconds - previous_elapsed)
