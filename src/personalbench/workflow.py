@@ -341,6 +341,18 @@ def evaluate_history(
         ):
             reuse_report = Path(manifest["reused_evidence_from"]["report"])
             reuse_benchmark = Path(manifest["reused_evidence_from"]["benchmark"])
+        if not report_path.exists() and reuse_benchmark is not None:
+            previous_scoring = read_json(reuse_benchmark).get("scoring", {})
+            if previous_scoring != benchmark.get("scoring", {}):
+                manifest["reuse_skipped"] = {
+                    "reason": "Scoring contract changed; the new revision requires fresh attempts",
+                    "source_benchmark": str(reuse_benchmark),
+                    "previous_scoring": previous_scoring,
+                    "scoring": benchmark.get("scoring", {}),
+                }
+                manifest.pop("reused_evidence_from", None)
+                reuse_report = reuse_benchmark = None
+                write_json(manifest_path, manifest)
         report = evaluate(
             benchmark,
             configuration,

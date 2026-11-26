@@ -476,3 +476,79 @@ def test_run_cli_accepts_fixed_preparation_gaps_but_rejects_ungraded_ready_tasks
     assert (
         main(["grade-recorded", str(benchmark_path), "--output", str(tmp_path / "recorded")]) == 2
     )
+
+
+@pytest.mark.parametrize("already_pending", [False, True])
+def test_scoring_contract_change_runs_fresh_without_reusing_incompatible_policy(
+    tmp_path, already_pending
+):
+    from personalbench import workflow
+
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    source(sessions)
+    output = tmp_path / "evaluation"
+    kwargs = {
+        "compiler_config": config("compiler"),
+        "judge_config": config("judge"),
+        "roots": [sessions],
+        "as_of": "2026-11-26T20:00:00Z",
+        "allow_unsafe_local": True,
+    }
+    with (
+        patch("personalbench.workflow.model_callback", side_effect=callback),
+        patch("personalbench.engine.model_callback", side_effect=callback),
+        patch("personalbench.engine.run_candidate", side_effect=candidate),
+    ):
+        initial = evaluate_history(output, config("candidate"), **kwargs)
+    previous_benchmark = output / "benchmark.json"
+    original_benchmark = previous_benchmark.read_bytes()
+    previous_report = output / "run/report.json"
+    original_report = previous_report.read_bytes()
+    old_criteria = initial["report"]["task_manifest"][0]["criteria"]
+    real_build = workflow.build_history
+
+    def new_contract(*args, **build_kwargs):
+        benchmark = real_build(*args, **build_kwargs)
+        benchmark["scoring"]["success_contract"] = "synthetic-new-contract"
+        return benchmark
+
+    if already_pending:
+        # Reproduce a refresh that wrote the revision manifest/benchmark, then
+        # failed before a run report could be created due to incompatible reuse.
+        new_benchmark = json.loads(original_benchmark)
+        new_benchmark["scoring"]["success_contract"] = "synthetic-new-contract"
+        (output / "benchmark.v2.json").write_text(json.dumps(new_benchmark))
+        manifest = json.loads((output / "workflow.json").read_text())
+        manifest.update(
+            benchmark_path="benchmark.v2.json",
+            run_directory="run.v2",
+            revision=2,
+            stage="evaluation",
+            reused_evidence_from={
+                "report": str(previous_report),
+                "benchmark": str(previous_benchmark),
+            },
+        )
+        (output / "workflow.json").write_text(json.dumps(manifest))
+    with (
+        patch("personalbench.workflow.build_history", side_effect=new_contract),
+        patch("personalbench.workflow.model_callback", side_effect=callback),
+        patch("personalbench.engine.model_callback", side_effect=callback),
+        patch("personalbench.engine.run_candidate", side_effect=candidate) as invoked,
+    ):
+        result = evaluate_history(
+            output,
+            config("candidate"),
+            resume=True,
+            refresh_preparation=not already_pending,
+            **kwargs,
+        )
+    assert invoked.call_count == 1
+    assert result["workflow"]["stage"] == "complete"
+    assert result["workflow"].get("reused_evidence_from") is None
+    assert "Scoring contract changed" in result["workflow"]["reuse_skipped"]["reason"]
+    assert result["report"].get("reuse") is None
+    assert result["report"]["task_manifest"][0]["criteria"] == old_criteria
+    assert previous_report.read_bytes() == original_report
+    assert previous_benchmark.read_bytes() == original_benchmark
