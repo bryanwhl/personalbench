@@ -13,14 +13,16 @@ from pathlib import Path
 
 from . import __version__
 from .capture import capture_finish, capture_start, capture_watch
+from .curation import CurationError, curate_benchmark
 from .engine import evaluate, model_callback
-from .history import build_history, discover_sessions, parse_as_of
+from .history import _normalize, build_history, discover_sessions, parse_as_of
 from .imports import build_benchmark, import_session
 from .privacy import DEFAULT_HOME, read_json, scan_paths, write_json, write_private
 from .recovery import extract_evidence
 from .report import render_report
 from .schema import validate_benchmark
 from .scoring import compare_reports
+from .session_io import read_session_bytes
 from .workflow import _preparation_identity, evaluate_history
 
 
@@ -50,7 +52,13 @@ def _model_options(parser):
 
 def _history_options(parser):
     parser.add_argument(
-        "--days", type=int, default=60, help="Trailing history window (default: 60 days)"
+        "--days", type=int, default=120, help="Trailing history window (default: 120 days)"
+    )
+    parser.add_argument(
+        "--include-automations",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Include automation-origin requests (default: human coding-agent work only)",
     )
     parser.add_argument("--as-of", help="ISO timestamp with timezone; default: now")
     parser.add_argument("--source", choices=["all", "codex", "claude"], default="all")
@@ -81,6 +89,7 @@ def _discover(args, snapshot_dir=None):
         exclude=[Path(p) for p in args.exclude_session],
         exclude_session_ids=_excluded_ids(args),
         snapshot_dir=snapshot_dir,
+        include_automations=bool(args.include_automations),
     )
 
 
@@ -93,7 +102,7 @@ def parser():
     imp.add_argument("--format", choices=["auto", "codex", "claude", "normalized"], default="auto")
     imp.add_argument("--output")
     build = sub.add_parser("build", help="Compile goals and criteria into a benchmark")
-    build.add_argument("session", nargs="?", help="One session; omit for the past 60 days")
+    build.add_argument("session", nargs="?", help="One session; omit for the past 120 days")
     _history_options(build)
     build.add_argument("--output")
     build.add_argument("--name", default="Personal benchmark")
@@ -101,10 +110,16 @@ def parser():
         "--compiler", help="Optional model configuration for autonomous goal compilation"
     )
     build.add_argument("--allow-unsafe-local", action="store_true")
+    build.add_argument("--curator", help="Global deduplication model config; defaults to compiler")
     build.add_argument("--resume", action="store_true")
     build.add_argument("--workers", type=int, default=3)
-    build.add_argument("--max-preparation-seconds", type=float, default=1800)
-    flow = sub.add_parser("evaluate", help="Freeze, prepare, recover and evaluate the past 60 days")
+    build.add_argument(
+        "--max-preparation-seconds",
+        type=float,
+        default=1800,
+        help="Per-invocation preparation budget; prior call usage is retained on resume",
+    )
+    flow = sub.add_parser("evaluate", help="Distill unique task families from the past 120 days")
     _history_options(flow)
     _model_options(flow)
     flow.add_argument("--config", required=True)
@@ -112,6 +127,7 @@ def parser():
         "--compiler", help="Compiler config; defaults to candidate model with tools disabled"
     )
     flow.add_argument("--output")
+    flow.add_argument("--curator", help="Global deduplication model config; defaults to compiler")
     flow.add_argument("--resume", action="store_true")
     flow.add_argument(
         "--refresh-preparation",
@@ -177,7 +193,8 @@ def parser():
 
 
 def main(argv=None):
-    args = parser().parse_args(argv)
+    arguments = list(argv if argv is not None else sys.argv[1:])
+    args = parser().parse_args(arguments)
     try:
         if args.action == "import":
             session = import_session(Path(args.session).expanduser(), format=args.format)
@@ -193,12 +210,20 @@ def main(argv=None):
         elif args.action == "evaluate":
             stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S-%fZ")
             output = _destination(args.output, f"evaluations/{stamp}")
+            if args.resume and (output / "workflow.json").exists():
+                frozen = read_json(output / "workflow.json")["identity"]
+                if not any(value == "--days" or value.startswith("--days=") for value in arguments):
+                    args.days = frozen["days"]
+                if args.include_automations is None:
+                    args.include_automations = frozen.get("include_automations", True)
             result = evaluate_history(
                 output,
                 read_json(Path(args.config)),
                 compiler_config=read_json(Path(args.compiler)) if args.compiler else None,
                 judge_config=read_json(Path(args.judge)) if args.judge else None,
+                curator_config=read_json(Path(args.curator)) if args.curator else None,
                 days=args.days,
+                include_automations=args.include_automations,
                 as_of=args.as_of,
                 source=args.source,
                 roots=[Path(p) for p in args.session_root] if args.session_root else None,
@@ -223,6 +248,17 @@ def main(argv=None):
                     "report": workflow.get("report"),
                     "sources": workflow.get("source_status", {}),
                     "goals": workflow.get("goal_readiness", {}),
+                    "curation": {
+                        key: value
+                        for key, value in workflow.get("curation", {}).items()
+                        if key
+                        in {
+                            "original_occurrences",
+                            "family_count",
+                            "duplicates_removed",
+                            "daily_brief_occurrences",
+                        }
+                    },
                     "success_pct": summary.get("success_pct"),
                     "output_quality_pct": summary.get("output_quality_pct"),
                     "efficiency_pct": summary.get("efficiency_pct"),
@@ -238,21 +274,30 @@ def main(argv=None):
             if not report or workflow.get("stage") != "complete":
                 return 2
         elif args.action == "build":
-            calls = []
+            output = _destination(args.output, "benchmark.json")
+            preparation_path = output.with_suffix(".preparation.json")
+            calls = (
+                read_json(preparation_path).get("calls", [])
+                if args.resume and preparation_path.exists()
+                else []
+            )
+            preparation_deadline = time.monotonic() + args.max_preparation_seconds
+            compiler_config = read_json(Path(args.compiler)) if args.compiler else None
             compiler = (
                 model_callback(
-                    read_json(Path(args.compiler)),
+                    compiler_config,
                     allow_unsafe_local=args.allow_unsafe_local,
                     calls=calls,
-                    deadline=time.monotonic() + args.max_preparation_seconds,
+                    deadline=preparation_deadline,
                 )
                 if args.compiler
                 else None
             )
             output = _destination(args.output, "benchmark.json")
             if args.session:
-                session = import_session(Path(args.session).expanduser())
                 raw_path = Path(args.session).expanduser()
+                session = _normalize(read_session_bytes(raw_path))
+                write_json(output.with_suffix(".normalized.json"), session)
                 if raw_path.name.endswith((".jsonl", ".jsonl.zst")):
                     session["evidence"] = extract_evidence(raw_path)
                 benchmark = build_benchmark(session, name=args.name, compiler=compiler)
@@ -288,10 +333,42 @@ def main(argv=None):
                     resume=args.resume,
                     workers=args.workers,
                     prepare_session=prepare_session,
-                    compiler_identity=_preparation_identity(read_json(Path(args.compiler)))
+                    compiler_identity=_preparation_identity(compiler_config)
                     if args.compiler
                     else None,
                 )
+            if compiler:
+                # Corpus-wide curation is mandatory for newly compiled datasets,
+                # including explicitly selected multi-goal sessions.
+                from .workflow import _assessor_config
+
+                curator_config = _assessor_config(
+                    compiler_config,
+                    read_json(Path(args.curator)) if args.curator else None,
+                    "curator",
+                )
+                write_json(output.with_suffix(".uncurated.json"), benchmark)
+                try:
+                    benchmark = curate_benchmark(
+                        benchmark,
+                        curator=model_callback(
+                            curator_config,
+                            allow_unsafe_local=args.allow_unsafe_local,
+                            calls=calls,
+                            deadline=preparation_deadline,
+                        ),
+                        artifact_dir=output.parent / (output.stem + ".curation"),
+                        curator_identity=curator_config,
+                        resume=args.resume,
+                        progress=lambda event: print(
+                            json.dumps({"stage": "curation", **event}), file=sys.stderr
+                        ),
+                    )
+                except CurationError as exc:
+                    write_json(output.with_suffix(".curation-error.json"), exc.as_dict())
+                    raise
+                finally:
+                    write_json(output.with_suffix(".preparation.json"), {"calls": calls})
             write_json(output, benchmark)
             if calls:
                 write_json(output.with_suffix(".preparation.json"), {"calls": calls})
@@ -301,6 +378,13 @@ def main(argv=None):
                     "tasks": len(benchmark["tasks"]),
                     "ready": sum(t.get("readiness") == "ready" for t in benchmark["tasks"]),
                     "preparation": "model_proposed" if compiler else "fallback_draft",
+                    "curation": {
+                        key: value
+                        for key, value in benchmark.get("history", {})
+                        .get("semantic_curation", {})
+                        .items()
+                        if key in {"original_occurrences", "family_count", "duplicates_removed"}
+                    },
                     **(
                         {
                             "history": {

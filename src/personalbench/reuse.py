@@ -47,8 +47,10 @@ def reuse_revision_evidence(
         original = validate_benchmark(read_json(benchmark_path))
         if canonical_hash(original) != previous.get("benchmark_hash"):
             raise ValueError("Evidence reuse needs the exact original full benchmark")
-        if previous.get("run_status") != "complete":
-            raise ValueError("Evidence reuse requires a completed previous workflow run")
+        if previous.get("run_status") not in {"complete", "interrupted"}:
+            raise ValueError(
+                "Evidence reuse requires a completed or safely interrupted previous run"
+            )
         if identity["baseline_type"] != "fresh" or previous.get("baseline_type") != "fresh":
             raise ValueError("Evidence reuse cannot mix recorded and fresh observations")
         for key in ("configuration", "repeats", "runtime"):

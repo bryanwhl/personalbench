@@ -56,7 +56,7 @@ def compiler(_):
 def test_window_uses_recorded_activity_not_filename_or_mtime(tmp_path):
     old_name = session(tmp_path, "rollout-2026-08-20.jsonl", "2026-11-25T10:00:00Z")
     os.utime(old_name, (1, 1))
-    stale = session(tmp_path, "copied-today.jsonl", "2026-09-01T10:00:00Z")
+    stale = session(tmp_path, "copied-today.jsonl", "2026-05-01T10:00:00Z")
     future = session(tmp_path, "future.jsonl", "2026-12-01T10:00:00Z")
     undated = session(tmp_path, "undated.jsonl", "not a timestamp")
     result = discover_sessions(roots=[tmp_path], as_of=NOW)
@@ -124,7 +124,7 @@ def test_exclusions_and_explicit_roots_do_not_expand_scope(tmp_path):
     assert result["sessions"][0]["reason"] == "explicit exclusion"
 
 
-def test_cli_default_build_is_sixty_day_corpus_with_audit(tmp_path, capsys):
+def test_cli_default_build_is_120_day_corpus_with_audit(tmp_path, capsys):
     root = tmp_path / "sessions"
     session(root, "selected.jsonl", "2026-11-25T10:00:00Z")
     out = tmp_path / "out.json"
@@ -135,7 +135,7 @@ def test_cli_default_build_is_sixty_day_corpus_with_audit(tmp_path, capsys):
         == 0
     )
     result = json.loads(out.read_text())
-    assert result["history"]["days"] == 60
+    assert result["history"]["days"] == 120
     assert out.with_suffix(".inventory.json").exists()
     assert parser().parse_args(["sessions"]).source == "all"
     summary = json.loads(capsys.readouterr().out)
@@ -185,7 +185,7 @@ def test_cli_explicit_session_overrides_corpus_discovery(tmp_path):
 
 
 def test_old_goals_in_resumed_session_are_context_not_recent_tasks(tmp_path):
-    path = session(tmp_path, "resumed.jsonl", "2026-08-01T10:00:00Z", "Explain stack")
+    path = session(tmp_path, "resumed.jsonl", "2026-05-01T10:00:00Z", "Explain stack")
     with path.open("a") as stream:
         for row in [
             {
@@ -258,7 +258,7 @@ def test_as_of_freezes_resumed_chat_and_prevents_future_answer_leakage(tmp_path)
 
 
 def test_metadata_only_recent_activity_does_not_expand_user_window(tmp_path):
-    path = session(tmp_path, "old.jsonl", "2026-08-01T10:00:00Z")
+    path = session(tmp_path, "old.jsonl", "2026-05-01T10:00:00Z")
     with path.open("a") as stream:
         stream.write(
             "\n"
@@ -1099,3 +1099,324 @@ def test_fork_goal_source_scope_uses_record_order_when_timestamps_are_tied(tmp_p
     assert len(result["tasks"]) == 1
     child = next(row for row in inventory["sessions"] if row["session_id"] == "child")
     assert child["duplicate_tasks"][0]["proof"]["source_observation_count"] == 2
+
+
+def test_default_scope_is_120_days_and_excludes_explicit_automation_not_human_daily_task(tmp_path):
+    automated = session(
+        tmp_path,
+        "automated.jsonl",
+        "2026-11-25T10:00:00Z",
+        "Automation: Daily brief\nAutomation ID: daily\nAutomation memory: /private/memory.md\n\nPrepare a morning brief",
+    )
+    human = session(
+        tmp_path,
+        "human.jsonl",
+        "2026-08-20T10:00:00Z",
+        "Fix my daily morning brief automation code",
+    )
+    inventory = discover_sessions(roots=[tmp_path], as_of=NOW)
+    rows = {Path(row["path"]).name: row for row in inventory["sessions"]}
+    assert inventory["days"] == 120
+    assert inventory["include_automations"] is False
+    assert rows[automated.name]["status"] == "excluded"
+    assert "automation-origin" in rows[automated.name]["reason"]
+    assert rows[human.name]["status"] == "selected"
+    assert inventory["scope_counts"] == {"excluded": 1, "selected": 1}
+    assert rows[automated.name]["window_request_origin_counts"] == {"automation": 1}
+    opted_in = discover_sessions(roots=[tmp_path], as_of=NOW, include_automations=True)
+    assert all(row["status"] == "selected" for row in opted_in["sessions"])
+
+
+def test_automation_metadata_marks_origin_without_excluding_later_human_followups(tmp_path):
+    path = session(tmp_path, "mixed.jsonl", "2026-11-25T10:00:00Z", "Prepare report")
+    original = path.read_text()
+    metadata = {
+        "timestamp": "2026-11-25T09:59:00Z",
+        "payload": {"id": "automatic", "source": "automation"},
+    }
+    metadata["type"] = "session_meta"
+    path.write_text(json.dumps(metadata) + "\n" + original)
+    first = discover_sessions(roots=[tmp_path], as_of=NOW)
+    assert first["sessions"][0]["status"] == "excluded"
+    with path.open("a") as stream:
+        stream.write(
+            "\n"
+            + json.dumps(
+                {
+                    "type": "event_msg",
+                    "timestamp": "2026-11-25T11:00:00Z",
+                    "payload": {
+                        "type": "user_message",
+                        "message": "Fix the implementation causing this failure",
+                    },
+                }
+            )
+        )
+    mixed = discover_sessions(roots=[tmp_path], as_of=NOW)
+    assert mixed["sessions"][0]["status"] == "selected"
+    assert mixed["sessions"][0]["request_origin_counts"] == {"automation": 1, "human": 1}
+
+
+def test_control_plane_delegation_is_not_human_activity_and_raw_snapshot_stays_intact(tmp_path):
+    pure = session(
+        tmp_path,
+        "delegated.jsonl",
+        "2026-11-25T10:00:00Z",
+        "<codex_delegation><input>Implement a solution</input></codex_delegation>",
+    )
+    mixed = session(
+        tmp_path,
+        "mixed.jsonl",
+        "2026-11-24T10:00:00Z",
+        "<codex_delegation><input>PRIVATE CONTROL PLANE</input></codex_delegation>\nExplain a stack",
+    )
+    inventory = discover_sessions(roots=[tmp_path], as_of=NOW, snapshot_dir=tmp_path / "snapshots")
+    rows = {Path(row["path"]).name: row for row in inventory["sessions"]}
+    assert rows[pure.name]["status"] == "excluded"
+    assert rows[pure.name]["reason"] == "control-plane delegation only; no human requests"
+    assert rows[mixed.name]["status"] == "selected"
+    assert "PRIVATE CONTROL PLANE" in Path(rows[mixed.name]["snapshot_path"]).read_text()
+
+    def check(prompt):
+        assert "PRIVATE CONTROL PLANE" not in prompt
+        assert "Explain a stack" in prompt
+        return compiler(prompt)
+
+    result = build_history(inventory, compiler=check)
+    assert len(result["tasks"]) == 1
+
+
+def test_mixed_session_retains_human_context_but_excludes_automation_only_compiled_goal(tmp_path):
+    path = session(
+        tmp_path,
+        "mixed.jsonl",
+        "2026-11-25T10:00:00Z",
+        "Automation: report\nAutomation ID: report\n\nPrepare the report",
+    )
+    with path.open("a") as stream:
+        for message in [
+            {"type": "user_message", "message": "Fix the report parser"},
+            {"type": "agent_message", "message": "Fixed parser"},
+        ]:
+            stream.write(
+                "\n"
+                + json.dumps(
+                    {"type": "event_msg", "timestamp": "2026-11-25T11:00:00Z", "payload": message}
+                )
+            )
+
+    def split(_):
+        return json.dumps(
+            {
+                "tasks": [
+                    {
+                        "id": name,
+                        "brief": brief,
+                        "requires_starting_state": False,
+                        "source_message_indices": indices,
+                        "criteria": [{"id": "complete", "description": brief}],
+                    }
+                    for name, brief, indices in [
+                        ("automatic", "Prepare report", [0, 1]),
+                        ("human", "Fix report parser", [2, 3]),
+                    ]
+                ]
+            }
+        )
+
+    inventory = discover_sessions(roots=[tmp_path], as_of=NOW)
+    result = build_history(inventory, compiler=split)
+    assert len(result["tasks"]) == 1
+    assert result["tasks"][0]["brief"] == "Fix report parser"
+    assert "automation-origin" in inventory["sessions"][0]["excluded_tasks"][0]["reason"]
+    opted_in = build_history(
+        discover_sessions(roots=[tmp_path], as_of=NOW, include_automations=True), compiler=split
+    )
+    assert len(opted_in["tasks"]) == 2
+
+
+def test_delegation_activity_cannot_pull_an_old_human_goal_into_history_window(tmp_path):
+    path = session(tmp_path, "old-with-handoff.jsonl", "2026-05-01T10:00:00Z", "Fix the parser")
+    with path.open("a") as stream:
+        stream.write(
+            "\n"
+            + json.dumps(
+                {
+                    "type": "event_msg",
+                    "timestamp": "2026-11-25T10:00:00Z",
+                    "payload": {
+                        "type": "user_message",
+                        "message": "<codex_delegation><input>Continue old work</input></codex_delegation>",
+                    },
+                }
+            )
+        )
+    inventory = discover_sessions(roots=[tmp_path], as_of=NOW)
+    assert inventory["sessions"][0]["reason"] == "outside history window"
+    assert inventory["sessions"][0]["request_origin_counts"] == {"human": 1, "control_plane": 1}
+
+
+def test_human_request_about_delegation_markup_is_not_control_plane(tmp_path):
+    path = session(
+        tmp_path,
+        "parser.jsonl",
+        "2026-11-25T10:00:00Z",
+        "Write a parser for this example: <codex_delegation><input>Example data</input></codex_delegation>",
+    )
+    inventory = discover_sessions(roots=[tmp_path], as_of=NOW)
+    assert inventory["sessions"][0]["status"] == "selected"
+    assert inventory["sessions"][0]["request_origin_counts"] == {"human": 1}
+    assert path.exists()
+
+
+def test_heartbeat_solution_hints_never_become_compiler_user_constraints(tmp_path):
+    path = session(
+        tmp_path, "heartbeat.jsonl", "2026-11-25T10:00:00Z", "Fix the HFlow catalog default"
+    )
+    heartbeat = "<heartbeat><automation_id>queue</automation_id><instructions>SECRET_SOLUTION_COMMIT expected passing count123 and PR37</instructions></heartbeat>"
+    with path.open("a") as stream:
+        stream.write(
+            "\n"
+            + json.dumps(
+                {
+                    "type": "event_msg",
+                    "timestamp": "2026-11-25T11:00:00Z",
+                    "payload": {"type": "user_message", "message": heartbeat},
+                }
+            )
+        )
+
+    def check(prompt):
+        assert "SECRET_SOLUTION_COMMIT" not in prompt
+        assert "passing count123" not in prompt
+        assert "Fix the HFlow catalog default" in prompt
+        return json.dumps(
+            {
+                "tasks": [
+                    {
+                        "id": "fix",
+                        "brief": "Fix the catalog default",
+                        "requires_starting_state": False,
+                        "source_message_indices": [0, 1],
+                        "criteria": [{"id": "correct", "description": "Correct default"}],
+                    }
+                ]
+            }
+        )
+
+    inventory = discover_sessions(roots=[tmp_path], as_of=NOW, snapshot_dir=tmp_path / "snapshots")
+    assert inventory["sessions"][0]["request_origin_counts"] == {"human": 1, "control_plane": 1}
+    assert "SECRET_SOLUTION_COMMIT" in Path(inventory["sessions"][0]["snapshot_path"]).read_text()
+    result = build_history(inventory, compiler=check)
+    assert len(result["tasks"]) == 1
+    assert "SECRET_SOLUTION_COMMIT" not in json.dumps(result["tasks"])
+
+
+def test_heartbeat_cannot_extend_activity_and_outside_human_text_survives(tmp_path):
+    old = session(tmp_path, "old.jsonl", "2026-05-01T10:00:00Z", "Fix old issue")
+    with old.open("a") as stream:
+        stream.write(
+            "\n"
+            + json.dumps(
+                {
+                    "type": "event_msg",
+                    "timestamp": "2026-11-25T11:00:00Z",
+                    "payload": {
+                        "type": "user_message",
+                        "message": "<heartbeat><instructions>Continue old work</instructions></heartbeat>",
+                    },
+                }
+            )
+        )
+    session(
+        tmp_path,
+        "mixed.jsonl",
+        "2026-11-25T10:00:00Z",
+        "<heartbeat><instructions>PRIVATE QUEUE</instructions></heartbeat>\nExplain a stack",
+    )
+    inventory = discover_sessions(roots=[tmp_path], as_of=NOW)
+    rows = {Path(row["path"]).name: row for row in inventory["sessions"]}
+    assert rows["old.jsonl"]["reason"] == "outside history window"
+    assert rows["mixed.jsonl"]["status"] == "selected"
+
+    def check(prompt):
+        assert "PRIVATE QUEUE" not in prompt
+        assert "Explain a stack" in prompt
+        return compiler(prompt)
+
+    assert len(build_history(inventory, compiler=check)["tasks"]) == 1
+
+
+def test_human_request_quoting_heartbeat_example_is_preserved(tmp_path):
+    session(
+        tmp_path,
+        "example.jsonl",
+        "2026-11-25T10:00:00Z",
+        "Implement parsing for this example: <heartbeat><instructions>example</instructions></heartbeat>",
+    )
+    inventory = discover_sessions(roots=[tmp_path], as_of=NOW)
+    assert inventory["sessions"][0]["request_origin_counts"] == {"human": 1}
+    assert inventory["sessions"][0]["status"] == "selected"
+
+
+def test_replayed_frozen_inventory_refreshes_scope_counts_without_rediscovery_or_recompile(
+    tmp_path,
+):
+    path = session(tmp_path / "source", "hflow.jsonl", "2026-11-25T10:00:00Z", "Explain a stack")
+    with path.open("a") as stream:
+        stream.write(
+            "\n"
+            + json.dumps(
+                {
+                    "type": "event_msg",
+                    "timestamp": "2026-11-25T11:00:00Z",
+                    "payload": {
+                        "type": "user_message",
+                        "message": "<heartbeat><instructions>PRIVATE QUEUE HINT</instructions></heartbeat>",
+                    },
+                }
+            )
+        )
+    inventory = discover_sessions(roots=[path.parent], as_of=NOW, snapshot_dir=tmp_path / "frozen")
+    entry = inventory["sessions"][0]
+    calls = []
+
+    def counted(prompt):
+        calls.append(prompt)
+        return compiler(prompt)
+
+    artifact = tmp_path / "preparation"
+    first = build_history(
+        inventory, compiler=counted, artifact_dir=artifact, compiler_identity={"model": "test"}
+    )
+    entry.update(
+        request_origin_counts={"human": 2},
+        window_request_origin_counts={"human": 2},
+        last_activity="2026-11-25T11:00:00Z",
+        last_window_activity="2026-11-25T11:00:00Z",
+    )
+    with path.open("a") as stream:
+        stream.write(
+            "\n"
+            + json.dumps(
+                {
+                    "type": "event_msg",
+                    "timestamp": "2026-11-26T15:00:00Z",
+                    "payload": {"type": "user_message", "message": "UNFROZEN LATER REQUEST"},
+                }
+            )
+        )
+    second = build_history(
+        inventory,
+        compiler=counted,
+        artifact_dir=artifact,
+        compiler_identity={"model": "test"},
+        resume=True,
+    )
+    assert len(calls) == 1
+    assert entry["request_origin_counts"] == {"human": 1, "control_plane": 1}
+    assert entry["window_request_origin_counts"] == {"human": 1}
+    assert entry["last_activity"] == "2026-11-25T10:00:00+00:00"
+    assert entry["last_window_activity"] == "2026-11-25T10:00:00+00:00"
+    assert first["tasks"][0]["inputs"] == second["tasks"][0]["inputs"]
+    assert "UNFROZEN LATER REQUEST" not in calls[0]

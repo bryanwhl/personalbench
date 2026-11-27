@@ -10,6 +10,7 @@ from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .curation import CURATION_VERSION, CurationError, curate_benchmark
 from .engine import evaluate, model_callback
 from .history import build_history, discover_sessions, parse_as_of
 from .privacy import private_directory, read_json, write_json
@@ -43,7 +44,9 @@ def evaluate_history(
     *,
     compiler_config: dict | None = None,
     judge_config: dict | None = None,
-    days: int = 60,
+    curator_config: dict | None = None,
+    days: int = 120,
+    include_automations: bool | None = None,
     as_of: str | None = None,
     source: str = "all",
     roots: list[Path] | None = None,
@@ -69,6 +72,7 @@ def evaluate_history(
     validate_config(configuration)
     compiler_config = _assessor_config(configuration, compiler_config, "compiler")
     judge_config = _assessor_config(configuration, judge_config, "judge")
+    curator_config = _assessor_config(compiler_config, curator_config, "curator")
     if not allow_unsafe_local:
         raise ValueError("History evaluation requires --allow-unsafe-local for trusted tasks")
     for label, value in (("workers", workers), ("preparation_workers", preparation_workers)):
@@ -90,11 +94,22 @@ def evaluate_history(
         except BlockingIOError as exc:
             raise ValueError("Another process is already running this workflow") from exc
         manifest_path = output / "workflow.json"
+        previous_manifest = read_json(manifest_path) if manifest_path.exists() else None
+        if include_automations is None:
+            include_automations = (
+                previous_manifest["identity"].get("include_automations", True)
+                if previous_manifest and resume
+                else False
+            )
+        if not isinstance(include_automations, bool):
+            raise TypeError("include_automations must be boolean")
         identity = {
             "configuration": configuration,
             "compiler": compiler_config,
             "judge": judge_config,
+            "curator": curator_config,
             "days": days,
+            "include_automations": include_automations,
             "source": source,
             "roots": [str(Path(p).expanduser().resolve()) for p in roots] if roots else None,
             "exclude": [str(Path(p).expanduser().resolve()) for p in exclude or []],
@@ -106,7 +121,11 @@ def evaluate_history(
         if manifest_path.exists():
             if not resume:
                 raise ValueError("Workflow output already exists; use --resume or a new output")
-            manifest = read_json(manifest_path)
+            manifest = previous_manifest
+            # Legacy windows included automation runs. Plain resume preserves that
+            # frozen scope; refresh explicitly introduces the current curation stage.
+            manifest["identity"].setdefault("include_automations", True)
+            manifest["identity"].setdefault("curator", curator_config)
             if manifest["identity"] != identity:
                 old_settings = {
                     key: value
@@ -116,32 +135,30 @@ def evaluate_history(
                 new_settings = {
                     key: value for key, value in identity.items() if key != "preparation_identity"
                 }
-                old_compiler = dict(old_settings["compiler"])
-                new_compiler = dict(new_settings["compiler"])
-                prior_timeout = old_compiler.pop("timeout_seconds", 120)
-                next_timeout = new_compiler.pop("timeout_seconds", 120)
-                old_without_compiler = {
-                    key: value for key, value in old_settings.items() if key != "compiler"
-                }
-                new_without_compiler = {
-                    key: value for key, value in new_settings.items() if key != "compiler"
-                }
-                compiler_budget_increase = (
-                    refresh_preparation
-                    and next_timeout >= prior_timeout
-                    and old_compiler == new_compiler
-                    and old_without_compiler == new_without_compiler
-                )
-                if old_settings != new_settings and not compiler_budget_increase:
+                roles = {"compiler", "curator"}
+                old_scope = {k: v for k, v in old_settings.items() if k not in roles}
+                new_scope = {k: v for k, v in new_settings.items() if k not in roles}
+                extensions = []
+                budget_increase = refresh_preparation and old_scope == new_scope
+                for role in sorted(roles):
+                    old_role = dict(old_settings[role])
+                    new_role = dict(new_settings[role])
+                    before = old_role.pop("timeout_seconds", 120)
+                    after = new_role.pop("timeout_seconds", 120)
+                    budget_increase = budget_increase and old_role == new_role and after >= before
+                    if after != before:
+                        extensions.append(
+                            {
+                                "role": role,
+                                "previous_timeout_seconds": before,
+                                "timeout_seconds": after,
+                                "reason": "Explicit assessor timeout extension; completed decisions retained",
+                            }
+                        )
+                if old_settings != new_settings and not budget_increase:
                     raise ValueError("Cannot resume with changed configuration or scope")
-                if compiler_budget_increase and next_timeout != prior_timeout:
-                    manifest.setdefault("preparation_budget_changes", []).append(
-                        {
-                            "previous_timeout_seconds": prior_timeout,
-                            "timeout_seconds": next_timeout,
-                            "reason": "Explicit compiler timeout extension; completed decisions retained",
-                        }
-                    )
+                if budget_increase:
+                    manifest.setdefault("preparation_budget_changes", []).extend(extensions)
                 if (
                     refresh_preparation
                     or not (output / manifest.get("benchmark_path", "benchmark.json")).exists()
@@ -172,6 +189,7 @@ def evaluate_history(
                 roots=roots,
                 exclude=exclude,
                 exclude_session_ids=exclude_session_ids,
+                include_automations=include_automations,
                 snapshot_dir=output / "sources",
             )
             write_json(inventory_path, inventory)
@@ -191,6 +209,7 @@ def evaluate_history(
                         days=days,
                         as_of=parse_as_of(manifest["as_of"]),
                         roots=[Path(row["path"]).parent],
+                        include_automations=include_automations,
                     )
                     matching = next(
                         (entry for entry in latest["sessions"] if entry["path"] == row["path"]),
@@ -215,6 +234,7 @@ def evaluate_history(
                 read_json(preparation_path).get("calls", []) if preparation_path.exists() else []
             )
             preparation_started = time.monotonic()
+            inventory.setdefault("include_automations", include_automations)
             previous_elapsed = manifest.get("preparation_elapsed_seconds", 0)
             deadline = preparation_started + max(0, max_preparation_seconds - previous_elapsed)
             compiler = model_callback(
@@ -293,6 +313,55 @@ def evaluate_history(
                 write_json(inventory_path, inventory)
                 write_json(manifest_path, manifest)
                 return {"workflow": manifest, "report": None}
+            write_json(output / "benchmark.uncurated.json", benchmark)
+            manifest["stage"] = "curation"
+            write_json(manifest_path, manifest)
+
+            def curation_checkpoint(event):
+                manifest["preparation_elapsed_seconds"] = (
+                    previous_elapsed + time.monotonic() - preparation_started
+                )
+                write_json(preparation_path, {"calls": list(calls)})
+                write_json(manifest_path, manifest)
+                if progress:
+                    progress({"stage": "curation", **event})
+
+            try:
+                benchmark = curate_benchmark(
+                    benchmark,
+                    curator=model_callback(
+                        curator_config,
+                        allow_unsafe_local=allow_unsafe_local,
+                        calls=calls,
+                        deadline=deadline,
+                    ),
+                    artifact_dir=output / "curation",
+                    curator_identity=curator_config,
+                    resume=resume,
+                    progress=curation_checkpoint,
+                )
+            except CurationError as exc:
+                manifest.update(
+                    stage="curation_incomplete",
+                    curation_error=exc.as_dict(),
+                    source_status=dict(Counter(row["status"] for row in inventory["sessions"])),
+                    preparation_elapsed_seconds=previous_elapsed
+                    + time.monotonic()
+                    - preparation_started,
+                )
+                write_json(preparation_path, {"calls": list(calls)})
+                write_json(manifest_path, manifest)
+                return {"workflow": manifest, "report": None}
+            manifest.pop("curation_error", None)
+            manifest["curation"] = {
+                key: value
+                for key, value in benchmark["history"]["semantic_curation"].items()
+                if key not in {"families"}
+            }
+            manifest["curation_version"] = CURATION_VERSION
+            manifest["preparation_elapsed_seconds"] = (
+                previous_elapsed + time.monotonic() - preparation_started
+            )
             new_hash = canonical_hash(benchmark)
             if (
                 refresh_preparation
@@ -304,7 +373,7 @@ def evaluate_history(
                 manifest.pop("reused_evidence_from", None)
                 if (run_directory / "report.json").exists():
                     previous_report = read_json(run_directory / "report.json")
-                    if previous_report.get("run_status") == "complete":
+                    if previous_report.get("run_status") in {"complete", "interrupted"}:
                         reuse_report = run_directory / "report.json"
                         reuse_benchmark = benchmark_path
                         manifest["reused_evidence_from"] = {

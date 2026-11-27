@@ -8,6 +8,7 @@ import json
 import os
 import re
 import tempfile
+from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from datetime import UTC, datetime, timedelta
@@ -144,7 +145,41 @@ def _normalize(raw: bytes) -> dict:
     with tempfile.TemporaryDirectory(prefix="personalbench-history-") as directory:
         path = Path(directory) / "snapshot.jsonl"
         path.write_bytes(raw)
-        return import_session(path)
+        session = import_session(path)
+    metadata = _metadata(raw)
+    messages, counts = [], Counter()
+    first_user = True
+    for message in session["messages"]:
+        if message["role"] != "user":
+            messages.append(message)
+            continue
+        text = message["text"]
+        cleaned, delegated = _CONTROL_PLANE.subn("", text)
+        if delegated:
+            counts["control_plane"] += delegated
+            cleaned = _user_text(cleaned).strip()
+            if not cleaned:
+                continue
+            message = dict(message, text=cleaned)
+        automated = _automation_request(message["text"]) or (
+            first_user and metadata.get("automation_origin")
+        )
+        first_user = False
+        origin = "automation" if automated else "human"
+        counts[origin] += 1
+        if automated:
+            message = dict(message, request_origin="automation")
+        messages.append(message)
+    session["messages"] = messages
+    session["request_origin_counts"] = dict(counts)
+    return session
+
+
+_CONTROL_PLANE = re.compile(r"\A\s*<(codex_delegation|heartbeat)(?:\s[^>]*)?>[\s\S]*?</\1>\s*")
+
+
+def _automation_request(text: str) -> bool:
+    return bool(re.match(r"\A\s*(?:Automation:[^\n]*\n)?Automation ID:\s*[^\s]+", text))
 
 
 def _freeze(raw: bytes, as_of: datetime) -> bytes:
@@ -188,9 +223,16 @@ def _metadata(raw: bytes) -> dict:
             )
             return {
                 "session_id": payload.get("id"),
+                "cwd": payload.get("cwd"),
                 "parent_session_id": spawn.get("parent_thread_id"),
                 "forked_from_id": payload.get("forked_from_id"),
                 "internal_subagent": isinstance(source, dict) and "subagent" in source,
+                "automation_origin": bool(
+                    payload.get("automation_id")
+                    or source == "automation"
+                    or isinstance(source, dict)
+                    and source.get("automation")
+                ),
             }
     return {}
 
@@ -208,13 +250,14 @@ def _write_immutable(path: Path, raw: bytes):
 
 def discover_sessions(
     *,
-    days: int = 60,
+    days: int = 120,
     as_of: datetime | None = None,
     source: str = "all",
     roots: list[Path] | None = None,
     exclude: list[Path] | None = None,
     snapshot_dir: Path | None = None,
     exclude_session_ids: list[str] | None = None,
+    include_automations: bool = False,
 ) -> dict:
     """Select real user activity in the window, retaining earlier clarification context.
 
@@ -224,6 +267,8 @@ def discover_sessions(
     """
     if isinstance(days, bool) or not isinstance(days, int) or days <= 0:
         raise ValueError("--days must be a positive integer")
+    if not isinstance(include_automations, bool):
+        raise TypeError("include_automations must be a boolean")
     as_of = as_of or datetime.now(UTC)
     if as_of.tzinfo is None:
         raise ValueError("as_of must include a timezone")
@@ -277,13 +322,45 @@ def discover_sessions(
                     entry.update(status="excluded", reason="no user requests recorded")
                     entries.append(entry)
                     continue
+                entry["request_origin_counts"] = session["request_origin_counts"]
+                users = [message for message in session["messages"] if message["role"] == "user"]
+                all_dates = [
+                    stamp
+                    for message in users
+                    if (stamp := _stamp(message.get("timestamp"))) is not None
+                ]
+                entry["last_activity"] = max(all_dates).isoformat() if all_dates else None
+                entry["window_request_origin_counts"] = dict(
+                    Counter(
+                        message.get("request_origin", "human")
+                        for message in users
+                        if (stamp := _stamp(message.get("timestamp"))) is not None
+                        and start <= stamp <= as_of
+                    )
+                )
+                if not users and session["request_origin_counts"].get("control_plane"):
+                    entry.update(
+                        status="excluded", reason="control-plane delegation only; no human requests"
+                    )
+                    entries.append(entry)
+                    continue
+                if (
+                    not include_automations
+                    and users
+                    and all(message.get("request_origin") == "automation" for message in users)
+                ):
+                    entry.update(
+                        status="excluded",
+                        reason="automation-origin requests only; opt in with include_automations",
+                    )
+                    entries.append(entry)
+                    continue
                 dates = [
                     stamp
-                    for message in session["messages"]
-                    if message["role"] == "user"
+                    for message in users
+                    if (include_automations or message.get("request_origin") != "automation")
                     and (stamp := _stamp(message.get("timestamp"))) is not None
                 ]
-                entry["last_activity"] = max(dates).isoformat() if dates else None
                 recent = [stamp for stamp in dates if start <= stamp <= as_of]
                 if recent:
                     frozen = _freeze(raw, as_of)
@@ -316,7 +393,12 @@ def discover_sessions(
         "days": days,
         "as_of": as_of.isoformat(),
         "since": start.isoformat(),
-        "selection": "dated human user activity; earlier context retained; records frozen through as-of",
+        "selection": "dated coding-agent human requests; explicit automation-origin requests opt-in; control-plane delegations excluded; earlier context and frozen raw retained",
+        "include_automations": include_automations,
+        "scope_counts": dict(Counter(entry["status"] for entry in entries)),
+        "exclusion_reasons": dict(
+            Counter(entry["reason"] for entry in entries if entry.get("status") == "excluded")
+        ),
         "source": source,
         "roots": [str(Path(path).expanduser().resolve()) for path in roots],
         "excluded_session_ids": sorted(ids),
@@ -442,6 +524,8 @@ def _message_lines(raw, messages):
             text = _text(payload.get("message"))
         if role == "user":
             text = _user_text(text)
+            if _CONTROL_PLANE.search(text):
+                text = _user_text(_CONTROL_PLANE.sub("", text)).strip()
         if len(lines) < len(messages):
             expected = messages[len(lines)]
             if (
@@ -628,7 +712,7 @@ def _cache_index(artifact_dir, inventory):
 def build_history(
     inventory: dict,
     *,
-    name: str = "Personal benchmark — past 60 days",
+    name: str = "Personal benchmark — session history",
     compiler: Callable[[str], str] | None = None,
     progress: Callable[[dict], None] | None = None,
     artifact_dir: Path | None = None,
@@ -655,6 +739,37 @@ def build_history(
             workers=workers,
             prepare_session=prepare_session,
         )
+
+
+def _refresh_scope_summary(entry: dict, session: dict, inventory: dict) -> None:
+    """Recompute audit-only request counts from current normalization of frozen bytes."""
+    entry["request_origin_counts"] = dict(session.get("request_origin_counts", {}))
+    users = [message for message in session["messages"] if message["role"] == "user"]
+    dated = [
+        (message, stamp)
+        for message in users
+        if (stamp := _stamp(message.get("timestamp"))) is not None
+    ]
+    entry["last_activity"] = max((stamp for _, stamp in dated), default=None)
+    if entry["last_activity"] is not None:
+        entry["last_activity"] = entry["last_activity"].isoformat()
+    since, as_of = _stamp(inventory.get("since")), _stamp(inventory.get("as_of"))
+    if since is None or as_of is None:
+        return
+    window = [(message, stamp) for message, stamp in dated if since <= stamp <= as_of]
+    entry["window_request_origin_counts"] = dict(
+        Counter(message.get("request_origin", "human") for message, _ in window)
+    )
+    eligible = [
+        stamp
+        for message, stamp in window
+        if inventory.get("include_automations", False)
+        or message.get("request_origin") != "automation"
+    ]
+    if eligible:
+        entry["last_window_activity"] = max(eligible).isoformat()
+    else:
+        entry.pop("last_window_activity", None)
 
 
 def _build_history(
@@ -691,6 +806,7 @@ def _build_history(
             entry.update(_metadata(raw))
             stage = "import"
             session = _normalize(raw)
+            _refresh_scope_summary(entry, session, inventory)
             session["_source_message_lines"] = _message_lines(raw, session["messages"])
             stage = "preparation"
             if prepare_session is not None:
@@ -973,6 +1089,24 @@ def _build_history(
                 else []
             )
             users = [message for message in mapped if message["role"] == "user"]
+            if (
+                not inventory.get("include_automations", False)
+                and users
+                and all(message.get("request_origin") == "automation" for message in users)
+            ):
+                entry["excluded_tasks"].append(
+                    {
+                        "source_task_id": task["id"],
+                        "reason": "Mapped requests are automation-origin only; human coding-agent scope excludes them",
+                    }
+                )
+                continue
+            users = [
+                message
+                for message in users
+                if inventory.get("include_automations", False)
+                or message.get("request_origin") != "automation"
+            ]
             dates = [
                 stamp
                 for message in users
