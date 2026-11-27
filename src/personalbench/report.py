@@ -98,7 +98,7 @@ def render_report(report: dict) -> str:
         )
     history = report.get("history")
     history_section = ""
-    if isinstance(history, dict):
+    if isinstance(history, dict) and "sessions" in history:
         counts = Counter(row.get("status", "unknown") for row in history.get("sessions", []))
         history_section = (
             "<section><h2>Source coverage</h2><p>History window: "
@@ -113,6 +113,41 @@ def render_report(report: dict) -> str:
             "preparation errors do not count as successful tasks.</p>"
             "<details><summary>Source inventory and preparation decisions</summary><pre>"
             + _json(history)
+            + "</pre></details></section>"
+        )
+    curation_section = ""
+    curation = history.get("semantic_curation", {}) if isinstance(history, dict) else {}
+    if curation:
+        families = []
+        for family in curation.get("families", []):
+            families.append(
+                "<tr>"
+                + "".join(
+                    f"<td>{_escape(value)}</td>"
+                    for value in (
+                        family.get("label", ""),
+                        len(family.get("member_ids", [])),
+                        family.get("representative_task_id", ""),
+                        family.get("reason", ""),
+                    )
+                )
+                + "</tr>"
+            )
+        curation_section = (
+            "<section><h2>Unique task families</h2><p>"
+            + _escape(curation.get("original_occurrences", "unknown"))
+            + " original goal occurrences → "
+            + _escape(curation.get("family_count", "unknown"))
+            + " unique families; "
+            + _escape(curation.get("duplicates_removed", "unknown"))
+            + " duplicate occurrences consolidated. Each family contributes one unchanged original task, "
+            "selected before execution using input completeness and requirements, never results.</p>"
+            '<div class="table-wrap"><table><thead><tr><th scope="col">Task family</th>'
+            '<th scope="col">Occurrences</th><th scope="col">Representative</th>'
+            '<th scope="col">Grouping rationale</th></tr></thead><tbody>'
+            + "".join(families)
+            + "</tbody></table></div><details><summary>Global audit, memberships, and selection proof</summary><pre>"
+            + _json(curation)
             + "</pre></details></section>"
         )
     rows = []
@@ -261,6 +296,7 @@ Complete tasks: {_escape(coverage.get("complete_tasks", 0))}/{_escape(coverage.g
 <p class="muted">Unavailable means evidence is missing. Missing results never count as passing results.</p></section>
 {observed_note}
 {history_section}
+{curation_section}
 <section><h2>Results by task</h2><div class="table-wrap"><table><caption>Tasks have equal weight in the headline scores.</caption>
 <thead><tr><th scope="col">Task</th><th scope="col">Category</th><th scope="col">Quality</th><th scope="col">Success</th><th scope="col">Efficiency</th><th scope="col">Graded repeats</th><th scope="col">Reliability</th></tr></thead>
 <tbody>{"".join(rows)}</tbody></table></div></section>

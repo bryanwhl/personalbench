@@ -52,6 +52,21 @@ class ReportTests(unittest.TestCase):
             "scope_note": payload,
             "configuration": {"name": payload, "harness": "fixture"},
             "runtime": {"input_boundary": payload},
+            "history": {
+                "semantic_curation": {
+                    "original_occurrences": 2,
+                    "family_count": 1,
+                    "duplicates_removed": 1,
+                    "families": [
+                        {
+                            "label": payload,
+                            "reason": payload,
+                            "representative_task_id": payload,
+                            "member_ids": ["a", "b"],
+                        }
+                    ],
+                }
+            },
             "summary": {"tasks": [{"task_id": payload, "category": payload}], "method": payload},
             "trials": [
                 {

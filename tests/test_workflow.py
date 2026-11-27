@@ -607,3 +607,350 @@ def test_refresh_discards_native_evidence_from_a_legacy_input_boundary(tmp_path)
     assert result["report"].get("reuse") is None
     assert (output / "run/report.json").read_bytes() == original_report
     assert (output / "benchmark.json").read_bytes() == original_benchmark
+
+
+def test_failed_global_curator_blocks_candidates_and_resume_uses_compilation_and_local_cache(
+    tmp_path,
+):
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    path = source(sessions)
+    with path.open("a") as stream:
+        for timestamp, kind, text in [
+            ("2026-11-25T11:00:00Z", "user_message", "Explain a queue"),
+            ("2026-11-25T11:00:01Z", "agent_message", "PRIVATE QUEUE ANSWER"),
+        ]:
+            stream.write(
+                "\n"
+                + json.dumps(
+                    {
+                        "type": "event_msg",
+                        "timestamp": timestamp,
+                        "payload": {"type": kind, "message": text},
+                    }
+                )
+            )
+    output = tmp_path / "evaluation"
+    kwargs = {
+        "compiler_config": config("compiler"),
+        "curator_config": config("curator"),
+        "judge_config": config("judge"),
+        "roots": [sessions],
+        "as_of": "2026-11-26T20:00:00Z",
+        "allow_unsafe_local": True,
+    }
+    phases = []
+    fail_global = True
+
+    def assessor(configuration, **unused):
+        def call(prompt):
+            if configuration["name"] == "compiler":
+                phases.append("compiler")
+                return json.dumps(
+                    {
+                        "tasks": [
+                            {
+                                "id": subject,
+                                "category": "explanation",
+                                "brief": f"Explain a {subject}",
+                                "source_message_indices": indices,
+                                "requires_starting_state": False,
+                                "source_evidence_ids": [],
+                                "criteria": [
+                                    {
+                                        "id": "behavior",
+                                        "description": f"Explain {order} behavior",
+                                    }
+                                ],
+                            }
+                            for subject, indices, order in [
+                                ("stack", [0, 1], "LIFO"),
+                                ("queue", [2, 3], "FIFO"),
+                            ]
+                        ],
+                        "exclusions": [],
+                    }
+                )
+            assert configuration["name"] == "curator"
+            data = json.loads(
+                prompt.split("DATA:\n", 1)[1].split("\nCorrect the complete JSON", 1)[0]
+            )
+            local = "tasks" in data
+            phases.append("local" if local else "global")
+            if not local and fail_global:
+                return '{"families":[]}'
+            descriptors = (
+                data["tasks"]
+                if local
+                else [task for proposal in data["proposed_families"] for task in proposal["tasks"]]
+            )
+            response = {
+                "families": [
+                    {
+                        "label": task["brief"],
+                        "reason": "Stack LIFO and queue FIFO are distinct operations",
+                        "member_ids": [task["task_id"]],
+                    }
+                    for task in descriptors
+                ]
+            }
+            if not local:
+                response["audit"] = {
+                    "compared_proposal_ids": [p["proposal_id"] for p in data["proposed_families"]],
+                    "rationale": "Compared all families: stack LIFO differs from queue FIFO",
+                }
+            return json.dumps(response)
+
+        return call
+
+    with (
+        patch("personalbench.workflow.model_callback", side_effect=assessor),
+        patch(
+            "personalbench.engine.run_candidate",
+            side_effect=AssertionError("candidate before curation"),
+        ) as invoked,
+    ):
+        failed = evaluate_history(output, config("candidate"), **kwargs)
+    invoked.assert_not_called()
+    assert failed["workflow"]["stage"] == "curation_incomplete"
+    assert failed["report"] is None and not (output / "benchmark.json").exists()
+    assert phases == ["compiler", "local", "global", "global"]
+    phases.clear()
+    fail_global = False
+    with (
+        patch("personalbench.workflow.model_callback", side_effect=assessor),
+        patch("personalbench.engine.model_callback", side_effect=callback),
+        patch("personalbench.engine.run_candidate", side_effect=candidate) as invoked,
+    ):
+        repaired = evaluate_history(output, config("candidate"), resume=True, **kwargs)
+    assert phases == ["global"]
+    assert invoked.call_count == 2
+    assert repaired["workflow"]["stage"] == "complete"
+    assert repaired["workflow"]["curation"]["family_count"] == 2
+    assert repaired["report"]["summary"]["coverage"]["scored_trials"] == 2
+
+
+def test_assessor_timeout_extensions_preserve_cached_decisions_and_reject_semantic_changes(
+    tmp_path,
+):
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    source(sessions)
+    output = tmp_path / "evaluation"
+    kwargs = {
+        "compiler_config": {**config("compiler"), "timeout_seconds": 120},
+        "judge_config": config("judge"),
+        "roots": [sessions],
+        "as_of": "2026-11-26T20:00:00Z",
+        "allow_unsafe_local": True,
+    }
+    with (
+        patch("personalbench.workflow.model_callback", side_effect=callback),
+        patch("personalbench.engine.model_callback", side_effect=callback),
+        patch("personalbench.engine.run_candidate", side_effect=candidate),
+    ):
+        evaluate_history(output, config("candidate"), **kwargs)
+    kwargs["compiler_config"]["timeout_seconds"] = 240
+    with (
+        patch(
+            "personalbench.workflow.model_callback",
+            return_value=lambda _: pytest.fail("Recompiled cached source"),
+        ),
+        patch(
+            "personalbench.engine.run_candidate",
+            side_effect=AssertionError("Reexecuted saved candidate"),
+        ),
+    ):
+        extended = evaluate_history(
+            output, config("candidate"), resume=True, refresh_preparation=True, **kwargs
+        )
+        assert {row["role"] for row in extended["workflow"]["preparation_budget_changes"]} == {
+            "compiler",
+            "curator",
+        }
+        curator = dict(extended["workflow"]["identity"]["curator"], timeout_seconds=480)
+        extended = evaluate_history(
+            output,
+            config("candidate"),
+            curator_config=curator,
+            resume=True,
+            refresh_preparation=True,
+            **kwargs,
+        )
+    assert extended["workflow"]["stage"] == "complete"
+    latest = extended["workflow"]["preparation_budget_changes"][-1]
+    assert (latest["role"], latest["previous_timeout_seconds"], latest["timeout_seconds"]) == (
+        "curator",
+        240,
+        480,
+    )
+    with pytest.raises(ValueError, match="changed configuration"):
+        evaluate_history(
+            output,
+            config("candidate"),
+            curator_config=dict(curator, model="different-model"),
+            resume=True,
+            refresh_preparation=True,
+            **kwargs,
+        )
+
+
+def test_build_cli_resume_preserves_preparation_call_costs(tmp_path):
+    from personalbench.cli import main
+
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    source(sessions)
+    compiler_path = tmp_path / "compiler.json"
+    compiler_path.write_text(json.dumps(config("compiler")))
+    output = tmp_path / "benchmark.json"
+    args = [
+        "build",
+        "--session-root",
+        str(sessions),
+        "--compiler",
+        str(compiler_path),
+        "--as-of",
+        "2026-11-26T20:00:00Z",
+        "--output",
+        str(output),
+        "--allow-unsafe-local",
+    ]
+
+    def metered(configuration, **kwargs):
+        response = callback(configuration, **kwargs)
+
+        def call(prompt):
+            kwargs["calls"].append(
+                {"cost_usd": 2.5, "cost_kind": "synthetic", "usage": {"input_tokens": 7}}
+            )
+            return response(prompt)
+
+        return call
+
+    with patch("personalbench.cli.model_callback", side_effect=metered):
+        assert main(args) == 0
+    preparation = output.with_suffix(".preparation.json")
+    prior = json.loads(preparation.read_text())["calls"]
+    assert len(prior) == 1 and prior[0]["cost_usd"] == 2.5
+    with patch(
+        "personalbench.cli.model_callback",
+        return_value=lambda _: pytest.fail("Paid call during cached build"),
+    ):
+        assert main([*args, "--resume"]) == 0
+    assert json.loads(preparation.read_text())["calls"] == prior
+
+
+def test_selected_session_build_removes_control_plane_messages(tmp_path):
+    from personalbench.cli import main
+
+    path = source(tmp_path)
+    with path.open("a") as stream:
+        stream.write(
+            "\n"
+            + json.dumps(
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "message": "<heartbeat>INTERNAL SOLUTION HINT</heartbeat>",
+                    },
+                }
+            )
+        )
+    compiler = tmp_path / "compiler.json"
+    compiler.write_text(json.dumps(config("compiler")))
+    output = tmp_path / "benchmark.json"
+
+    def checked_callback(configuration, **kwargs):
+        response = callback(configuration, **kwargs)
+
+        def call(prompt):
+            assert "INTERNAL SOLUTION HINT" not in prompt
+            return response(prompt)
+
+        return call
+
+    with patch("personalbench.cli.model_callback", side_effect=checked_callback):
+        assert (
+            main(
+                [
+                    "build",
+                    str(path),
+                    "--compiler",
+                    str(compiler),
+                    "--output",
+                    str(output),
+                    "--allow-unsafe-local",
+                ]
+            )
+            == 0
+        )
+    normalized = json.loads(output.with_suffix(".normalized.json").read_text())
+    assert len(normalized["messages"]) == 2
+    assert "INTERNAL SOLUTION HINT" not in json.dumps(normalized)
+
+
+def test_evaluate_cli_legacy_resume_inherits_frozen_window_and_automation_scope(tmp_path):
+    from personalbench.cli import main
+
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    source(sessions)
+    output = tmp_path / "evaluation"
+    with (
+        patch("personalbench.workflow.model_callback", side_effect=callback),
+        patch("personalbench.engine.model_callback", side_effect=callback),
+        patch("personalbench.engine.run_candidate", side_effect=candidate),
+    ):
+        evaluate_history(
+            output,
+            config("candidate"),
+            compiler_config=config("compiler"),
+            judge_config=config("judge"),
+            days=60,
+            include_automations=True,
+            roots=[sessions],
+            as_of="2026-11-26T20:00:00Z",
+            allow_unsafe_local=True,
+        )
+    manifest_path = output / "workflow.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["identity"].pop("include_automations")
+    manifest["identity"].pop("curator")
+    manifest_path.write_text(json.dumps(manifest))
+    for name in ("candidate", "compiler", "judge"):
+        (tmp_path / f"{name}.json").write_text(json.dumps(config(name)))
+    with (
+        patch(
+            "personalbench.workflow.model_callback",
+            side_effect=AssertionError("Legacy resume recompiled"),
+        ),
+        patch(
+            "personalbench.engine.run_candidate",
+            side_effect=AssertionError("Legacy resume repeated candidate"),
+        ),
+    ):
+        assert (
+            main(
+                [
+                    "evaluate",
+                    "--config",
+                    str(tmp_path / "candidate.json"),
+                    "--compiler",
+                    str(tmp_path / "compiler.json"),
+                    "--judge",
+                    str(tmp_path / "judge.json"),
+                    "--session-root",
+                    str(sessions),
+                    "--output",
+                    str(output),
+                    "--resume",
+                    "--allow-unsafe-local",
+                ]
+            )
+            == 0
+        )
+    resumed = json.loads(manifest_path.read_text())
+    assert resumed["identity"]["days"] == 60
+    assert resumed["identity"]["include_automations"] is True
