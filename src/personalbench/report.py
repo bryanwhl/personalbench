@@ -116,6 +116,26 @@ def render_report(report: dict) -> str:
             + "</pre></details></section>"
         )
     curation_section = ""
+    suite_section = ""
+    suite = report.get("suite")
+    if isinstance(suite, dict):
+        origins = suite.get("origin_counts", {})
+        suite_section = (
+            "<section><h2>Runnable suite and source catalogue</h2><p>"
+            + _escape(sum(origins.values()))
+            + " runnable tasks from a catalogue of "
+            + _escape(suite.get("total_tasks", "unknown"))
+            + ". "
+            + _escape(origins.get("frozen_original", 0))
+            + " frozen original tasks; "
+            + _escape(origins.get("simulated", 0))
+            + " simulated adaptations. "
+            "These scores describe this runnable suite, not every historical catalogue task. "
+            "Simulated account changes do not change live accounts.</p>"
+            "<details><summary>Coverage and adaptation provenance</summary><pre>"
+            + _json(suite)
+            + "</pre></details></section>"
+        )
     curation = history.get("semantic_curation", {}) if isinstance(history, dict) else {}
     if curation:
         families = []
@@ -257,13 +277,20 @@ def render_report(report: dict) -> str:
             if trial.get("execution_trace")
             else ""
         )
+        environment_evidence = (
+            "<details><summary>Simulated environment: initial state, final state, tool operations</summary><pre>"
+            + _json(trial["environment"])
+            + "</pre></details>"
+            if trial.get("environment")
+            else ""
+        )
         attempts.append(
             f"<details><summary>Attempt {index}: {_escape(trial.get('task_id', ''))} "
             f"· repeat {_escape(trial.get('repeat', 'unknown'))}</summary>"
             f"<p>Grading: {_escape(grading.get('status', 'unknown'))}. "
             f"Quality: {_percent(grading.get('quality_pct'))}.</p>"
             f"<p>{_escape(grading.get('error', ''))}</p><ul>{''.join(evidence)}</ul>"
-            f"<h3>Measurements</h3><pre>{_json(metadata)}</pre>"
+            f"<h3>Measurements</h3><pre>{_json(metadata)}</pre>{environment_evidence}"
             f"<h3>Candidate output</h3><pre>{_escape(output)}</pre>{trace}</details>"
         )
     return f"""<!doctype html>
@@ -295,6 +322,7 @@ section {{ margin:32px 0; }} @media(max-width:500px) {{ body {{ padding:16px; }}
 Complete tasks: {_escape(coverage.get("complete_tasks", 0))}/{_escape(coverage.get("total_tasks", 0))}.</p>
 <p class="muted">Unavailable means evidence is missing. Missing results never count as passing results.</p></section>
 {observed_note}
+{suite_section}
 {history_section}
 {curation_section}
 <section><h2>Results by task</h2><div class="table-wrap"><table><caption>Tasks have equal weight in the headline scores.</caption>

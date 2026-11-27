@@ -23,6 +23,7 @@ from .report import render_report
 from .schema import validate_benchmark
 from .scoring import compare_reports
 from .session_io import read_session_bytes
+from .suites import build_replayable_suite
 from .workflow import _preparation_identity, evaluate_history
 
 
@@ -128,6 +129,15 @@ def parser():
     )
     flow.add_argument("--output")
     flow.add_argument("--curator", help="Global deduplication model config; defaults to compiler")
+    simulation = flow.add_mutually_exclusive_group()
+    simulation.add_argument(
+        "--variants", help="Explicit ready simulator adaptations for catalogue goals"
+    )
+    simulation.add_argument(
+        "--clear-variants",
+        action="store_true",
+        help="Withdraw frozen variants during an explicit preparation refresh",
+    )
     flow.add_argument("--resume", action="store_true")
     flow.add_argument(
         "--refresh-preparation",
@@ -142,6 +152,10 @@ def parser():
 
     val = sub.add_parser("validate", help="Validate a benchmark without running models")
     val.add_argument("benchmark")
+    suite = sub.add_parser("suite", help="Export a runnable suite and retain catalogue coverage")
+    suite.add_argument("catalogue")
+    suite.add_argument("--variants", help="Explicit simulated task adaptations")
+    suite.add_argument("--output", required=True)
     for name in ("run", "grade-recorded"):
         run = sub.add_parser(
             name, help="Execute fresh attempts" if name == "run" else "Grade recorded work"
@@ -196,7 +210,22 @@ def main(argv=None):
     arguments = list(argv if argv is not None else sys.argv[1:])
     args = parser().parse_args(arguments)
     try:
-        if args.action == "import":
+        if args.action == "suite":
+            benchmark = build_replayable_suite(
+                read_json(Path(args.catalogue)),
+                read_json(Path(args.variants)) if args.variants else None,
+            )
+            output = Path(args.output).expanduser()
+            write_json(output, benchmark)
+            _json(
+                {
+                    "output": str(output),
+                    "tasks": len(benchmark["tasks"]),
+                    "catalogue_tasks": benchmark["suite"]["total_tasks"],
+                    "origins": benchmark["suite"]["origin_counts"],
+                }
+            )
+        elif args.action == "import":
             session = import_session(Path(args.session).expanduser(), format=args.format)
             output = _destination(args.output, "session.json")
             write_json(output, session)
@@ -222,6 +251,8 @@ def main(argv=None):
                 compiler_config=read_json(Path(args.compiler)) if args.compiler else None,
                 judge_config=read_json(Path(args.judge)) if args.judge else None,
                 curator_config=read_json(Path(args.curator)) if args.curator else None,
+                simulation_variants=read_json(Path(args.variants)) if args.variants else None,
+                clear_variants=args.clear_variants,
                 days=args.days,
                 include_automations=args.include_automations,
                 as_of=args.as_of,

@@ -235,10 +235,13 @@ def test_refresh_revalidates_recovery_without_repeating_compilation_or_overwriti
         refreshed = evaluate_history(
             output, config("candidate"), resume=True, refresh_preparation=True, **kwargs
         )
-    assert refreshed["workflow"]["revision"] == 2
-    assert refreshed["report"]["summary"]["coverage"]["scored_trials"] == 0
+    assert refreshed["workflow"]["stage"] == "preparation_incomplete"
+    assert refreshed["report"] is None
+    assert refreshed["workflow"]["catalogue_readiness"] == {"incomplete": 1}
+    catalogue = json.loads((output / refreshed["workflow"]["catalogue_path"]).read_text())
+    assert catalogue["tasks"][0]["readiness"] == "incomplete"
     assert (output / "run/report.json").read_bytes() == original
-    assert (output / "run.v2/report.json").exists()
+    assert not (output / "run.v2/report.json").exists()
 
 
 def test_default_assessors_do_not_inherit_candidate_answer_instructions():
@@ -339,6 +342,7 @@ def test_refresh_does_not_reuse_stale_non_immediate_revision(tmp_path):
         "roots": [sessions],
         "as_of": "2026-11-26T20:00:00Z",
         "allow_unsafe_local": True,
+        "replayable_suite": False,  # Exercise explicit legacy catalogue revisions.
     }
     with (
         patch("personalbench.workflow.model_callback", side_effect=callback),
@@ -955,3 +959,394 @@ def test_evaluate_cli_legacy_resume_inherits_frozen_window_and_automation_scope(
     resumed = json.loads(manifest_path.read_text())
     assert resumed["identity"]["days"] == 60
     assert resumed["identity"]["include_automations"] is True
+
+
+def _suite_catalogue():
+    tasks = [
+        {
+            "id": identifier,
+            "category": "planning",
+            "brief": f"Return done for {identifier}",
+            "readiness": readiness,
+            "criteria": [
+                {"id": "result", "kind": "contains", "description": "Return done", "value": "done"}
+            ],
+        }
+        for identifier, readiness in [("a", "ready"), ("b", "incomplete"), ("c", "unsupported")]
+    ]
+    return {
+        "schema_version": 1,
+        "name": "Synthetic mixed catalogue",
+        "tasks": tasks,
+        "scoring": {"success_threshold": 80},
+        "history": {
+            "semantic_curation": {
+                "family_count": 3,
+                "original_occurrences": 3,
+                "duplicates_removed": 0,
+                "families": [
+                    {
+                        "family_id": f"family-{t['id']}",
+                        "member_ids": [t["id"]],
+                        "representative_task_id": t["id"],
+                    }
+                    for t in tasks
+                ],
+            }
+        },
+    }
+
+
+def _suite_options(tmp_path):
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    source(sessions)
+    return {
+        "compiler_config": config("compiler"),
+        "judge_config": config("judge"),
+        "roots": [sessions],
+        "as_of": "2026-11-26T20:00:00Z",
+        "allow_unsafe_local": True,
+    }
+
+
+def _suite_variant(catalogue):
+    from personalbench.schema import canonical_hash
+
+    original = catalogue["tasks"][2]
+    return {
+        "schema_version": 1,
+        "name": "Explicit synthetic replacement",
+        "tasks": [
+            {
+                "id": "simulated-c",
+                "category": "planning",
+                "brief": "Ensure the obsolete simulated calendar event is absent and report done.",
+                "readiness": "ready",
+                "execution_requirements": ["calendar-mail-v1"],
+                "criteria": [
+                    {
+                        "id": "result",
+                        "kind": "contains",
+                        "description": "Return done",
+                        "value": "done",
+                    },
+                    {
+                        "id": "deleted-state",
+                        "kind": "environment_state",
+                        "critical": True,
+                        "description": "The obsolete event is absent and unrelated calendar state is preserved.",
+                        "value": {
+                            "calendar_id": "primary",
+                            "absent_event_ids": ["obsolete"],
+                            "preserve_existing": True,
+                            "no_extra_events": True,
+                        },
+                    },
+                ],
+                "environment": {
+                    "kind": "calendar-mail-v1",
+                    "fixture_origin": "synthetic",
+                    "now": "2026-11-26T12:00:00Z",
+                    "timezone": "UTC",
+                    "calendars": [
+                        {
+                            "id": "primary",
+                            "events": [
+                                {
+                                    "id": "obsolete",
+                                    "summary": "Obsolete",
+                                    "start": {"dateTime": "2026-11-27T09:00:00Z"},
+                                    "end": {"dateTime": "2026-11-27T10:00:00Z"},
+                                }
+                            ],
+                        }
+                    ],
+                    "messages": [],
+                },
+                "provenance": {
+                    "adapted_from": original["id"],
+                    "adapted_from_hash": canonical_hash(original),
+                    "adaptation": "Replace missing live account state with an explicitly synthetic calendar/mail simulation.",
+                },
+            }
+        ],
+    }
+
+
+def _suite_candidate(task, *args, **kwargs):
+    import copy
+
+    result = {**candidate(task, *args, **kwargs), "output": "done"}
+    if task.get("environment"):
+        initial = copy.deepcopy(task["environment"])
+        final = copy.deepcopy(initial)
+        for calendar in final["calendars"]:
+            calendar["events"] = [
+                event for event in calendar["events"] if event["id"] != "obsolete"
+            ]
+        result["environment"] = {
+            "kind": "calendar-mail-v1",
+            "initial_state": initial,
+            "final_state": final,
+            "operations": [],
+        }
+    return result
+
+
+def test_fresh_workflow_evaluates_ready_only_suite_and_preserves_full_catalogue(tmp_path):
+    catalogue = _suite_catalogue()
+    kwargs = _suite_options(tmp_path)
+    output = tmp_path / "evaluation"
+    chosen = {**config("candidate"), "responses": {"a": "done"}}
+    with (
+        patch("personalbench.workflow.build_history", return_value=catalogue),
+        patch("personalbench.workflow.curate_benchmark", return_value=catalogue),
+    ):
+        result = evaluate_history(output, chosen, **kwargs)
+    workflow = result["workflow"]
+    benchmark = json.loads((output / workflow["benchmark_path"]).read_text())
+    assert [t["id"] for t in benchmark["tasks"]] == ["a"]
+    assert benchmark["tasks"][0] == catalogue["tasks"][0]
+    assert "history" not in benchmark
+    assert benchmark["suite"]["total_tasks"] == 3
+    assert workflow["goal_readiness"] == {"ready": 1}
+    assert workflow["catalogue_readiness"] == {"ready": 1, "incomplete": 1, "unsupported": 1}
+    assert workflow["curation"]["family_count"] == 3
+    assert json.loads((output / workflow["catalogue_path"]).read_text()) == catalogue
+    assert result["report"]["summary"]["coverage"]["total_tasks"] == 1
+    assert result["report"]["summary"]["success_pct"] == 100
+
+
+def test_explicit_environment_variant_is_a_labelled_replacement_in_default_suite(tmp_path):
+    catalogue = _suite_catalogue()
+    variants = _suite_variant(catalogue)
+    kwargs = _suite_options(tmp_path)
+    output = tmp_path / "evaluation"
+    chosen = {**config("candidate"), "responses": {"a": "done", "simulated-c": "done"}}
+    with (
+        patch("personalbench.workflow.build_history", return_value=catalogue),
+        patch("personalbench.workflow.curate_benchmark", return_value=catalogue),
+        patch(
+            "personalbench.engine.run_candidate",
+            side_effect=_suite_candidate,
+        ),
+    ):
+        result = evaluate_history(output, chosen, simulation_variants=variants, **kwargs)
+    benchmark = json.loads((output / result["workflow"]["benchmark_path"]).read_text())
+    assert benchmark["tasks"] == [catalogue["tasks"][0], variants["tasks"][0]]
+    assert benchmark["suite"]["origin_counts"] == {"frozen_original": 1, "simulated": 1}
+    assert benchmark["suite"]["variant_mapping"] == {"c": "simulated-c"}
+    assert result["workflow"]["goal_readiness"] == {"ready": 2}
+    assert result["report"]["summary"]["success_pct"] == 100
+    assert result["report"]["summary"]["coverage"]["total_tasks"] == 2
+    assert json.loads((output / "simulation-variants.json").read_text()) == variants
+    with (
+        patch(
+            "personalbench.engine.run_candidate",
+            side_effect=AssertionError("Repeated suite attempt"),
+        ),
+        patch(
+            "personalbench.workflow.model_callback",
+            side_effect=AssertionError("Repeated preparation"),
+        ),
+    ):
+        resumed = evaluate_history(output, chosen, resume=True, **kwargs)
+    assert resumed["report"]["trials"] == result["report"]["trials"]
+    frozen = output / "simulation-variants.json"
+    changed = json.loads(frozen.read_text())
+    changed["name"] += " tampered"
+    frozen.write_text(json.dumps(changed))
+    with pytest.raises(ValueError, match="Frozen simulation variants hash"):
+        evaluate_history(output, chosen, resume=True, **kwargs)
+    frozen.unlink()
+    with pytest.raises(ValueError, match="Frozen simulation variants are missing"):
+        evaluate_history(output, chosen, resume=True, **kwargs)
+
+
+def test_empty_replayable_suite_retains_catalogue_without_fake_benchmark(tmp_path):
+    catalogue = _suite_catalogue()
+    catalogue["tasks"] = catalogue["tasks"][1:]
+    kwargs = _suite_options(tmp_path)
+    output = tmp_path / "evaluation"
+    with (
+        patch("personalbench.workflow.build_history", return_value=catalogue),
+        patch("personalbench.workflow.curate_benchmark", return_value=catalogue),
+        patch(
+            "personalbench.engine.run_candidate", side_effect=AssertionError("Ran missing state")
+        ),
+    ):
+        result = evaluate_history(output, config("candidate"), **kwargs)
+    assert result["report"] is None
+    assert result["workflow"]["stage"] == "preparation_incomplete"
+    assert "No ready" in result["workflow"]["suite_error"]
+    assert (output / result["workflow"]["catalogue_path"]).exists()
+    assert not (output / "benchmark.json").exists()
+
+
+def test_legacy_plain_resume_preserves_catalogue_and_refresh_introduces_ready_suite(tmp_path):
+    from personalbench.suites import SUITE_VERSION
+
+    catalogue = _suite_catalogue()
+    kwargs = _suite_options(tmp_path)
+    output = tmp_path / "evaluation"
+    chosen = {**config("candidate"), "responses": {"a": "done"}}
+    with (
+        patch("personalbench.workflow.build_history", return_value=catalogue),
+        patch("personalbench.workflow.curate_benchmark", return_value=catalogue),
+    ):
+        original = evaluate_history(output, chosen, replayable_suite=False, **kwargs)
+    original_report = (output / "run/report.json").read_bytes()
+    path = output / "workflow.json"
+    manifest = json.loads(path.read_text())
+    manifest["identity"].pop("suite_policy")
+    manifest["identity"].pop("variants_hash")
+    path.write_text(json.dumps(manifest))
+    with patch("personalbench.engine.run_candidate", side_effect=AssertionError("Reran original")):
+        resumed = evaluate_history(output, chosen, resume=True, **kwargs)
+        assert resumed["report"]["trials"] == original["report"]["trials"]
+        assert resumed["workflow"]["identity"]["suite_policy"] == "legacy-catalogue-v1"
+        original_report = (output / "run/report.json").read_bytes()
+        with (
+            patch("personalbench.workflow.build_history", return_value=catalogue),
+            patch("personalbench.workflow.curate_benchmark", return_value=catalogue),
+        ):
+            refreshed = evaluate_history(
+                output, chosen, resume=True, refresh_preparation=True, **kwargs
+            )
+    assert refreshed["workflow"]["identity"]["suite_policy"] == SUITE_VERSION
+    assert refreshed["workflow"]["revision"] == 2
+    assert refreshed["workflow"]["goal_readiness"] == {"ready": 1}
+    assert refreshed["report"]["reuse"]["reused_trials"] == 1
+    assert len(refreshed["report"]["trials"]) == 1
+    assert (output / "run/report.json").read_bytes() == original_report
+
+
+def test_refresh_can_change_variants_but_not_candidate_or_scope(tmp_path):
+    import copy
+
+    catalogue = _suite_catalogue()
+    kwargs = _suite_options(tmp_path)
+    output = tmp_path / "evaluation"
+    chosen = {**config("candidate"), "responses": {"a": "done", "simulated-c": "done"}}
+    variants = _suite_variant(catalogue)
+    with (
+        patch("personalbench.workflow.build_history", return_value=catalogue),
+        patch("personalbench.workflow.curate_benchmark", return_value=catalogue),
+        patch(
+            "personalbench.engine.run_candidate",
+            side_effect=_suite_candidate,
+        ),
+    ):
+        evaluate_history(output, chosen, simulation_variants=variants, **kwargs)
+        changed = copy.deepcopy(variants)
+        changed["tasks"][0]["environment"]["now"] = "2026-11-27T12:00:00Z"
+        with pytest.raises(ValueError, match="changed configuration"):
+            evaluate_history(output, chosen, simulation_variants=changed, resume=True, **kwargs)
+        assert json.loads((output / "simulation-variants.json").read_text()) == variants
+        refreshed = evaluate_history(
+            output,
+            chosen,
+            simulation_variants=changed,
+            resume=True,
+            refresh_preparation=True,
+            **kwargs,
+        )
+        assert refreshed["workflow"]["revision"] == 2
+        assert refreshed["report"]["reuse"]["reused_trials"] == 1
+        assert len(refreshed["report"]["trials"]) == 2
+        assert refreshed["report"]["summary"]["success_pct"] == 100
+        with pytest.raises(ValueError, match="changed configuration"):
+            evaluate_history(
+                output,
+                {**chosen, "model": "different-model"},
+                simulation_variants=variants,
+                resume=True,
+                refresh_preparation=True,
+                **kwargs,
+            )
+        with pytest.raises(ValueError, match="changed configuration"):
+            evaluate_history(
+                output,
+                chosen,
+                simulation_variants=variants,
+                days=60,
+                resume=True,
+                refresh_preparation=True,
+                **kwargs,
+            )
+
+
+def test_explicit_refresh_can_withdraw_variants_without_losing_prior_audit(tmp_path):
+    catalogue = _suite_catalogue()
+    variants = _suite_variant(catalogue)
+    kwargs = _suite_options(tmp_path)
+    output = tmp_path / "evaluation"
+    chosen = {**config("candidate"), "responses": {"a": "done", "simulated-c": "done"}}
+    with (
+        patch("personalbench.workflow.build_history", return_value=catalogue),
+        patch("personalbench.workflow.curate_benchmark", return_value=catalogue),
+        patch(
+            "personalbench.engine.run_candidate",
+            side_effect=_suite_candidate,
+        ),
+    ):
+        initial = evaluate_history(output, chosen, simulation_variants=variants, **kwargs)
+        frozen = (output / "simulation-variants.json").read_bytes()
+        with patch(
+            "personalbench.engine.run_candidate",
+            side_effect=AssertionError("Repeated unchanged original"),
+        ):
+            cleared = evaluate_history(
+                output, chosen, resume=True, refresh_preparation=True, clear_variants=True, **kwargs
+            )
+    assert initial["workflow"]["identity"]["variants_hash"] is not None
+    manifest = cleared["workflow"]
+    assert manifest["identity"]["variants_hash"] is None
+    assert manifest["revision"] == 2
+    assert cleared["report"]["reuse"]["reused_trials"] == 1
+    suite = json.loads((output / manifest["benchmark_path"]).read_text())
+    assert [task["id"] for task in suite["tasks"]] == ["a"]
+    assert suite["suite"]["origin_counts"] == {"frozen_original": 1, "simulated": 0}
+    assert manifest["suite_policy_changes"][-1]["variants_hash"] == {
+        "before": initial["workflow"]["identity"]["variants_hash"],
+        "after": None,
+    }
+    assert (output / "simulation-variants.json").read_bytes() == frozen
+    with patch(
+        "personalbench.engine.run_candidate", side_effect=AssertionError("Reran cleared suite")
+    ):
+        resumed = evaluate_history(output, chosen, resume=True, **kwargs)
+    assert resumed["report"]["trials"] == cleared["report"]["trials"]
+    assert resumed["workflow"]["identity"]["variants_hash"] is None
+
+
+def test_clear_variants_requires_resume_refresh_and_no_replacement(tmp_path):
+    with pytest.raises(ValueError, match="requires resume"):
+        evaluate_history(
+            tmp_path / "unused", config("candidate"), clear_variants=True, allow_unsafe_local=True
+        )
+    assert not (tmp_path / "unused").exists()
+    catalogue = _suite_catalogue()
+    kwargs = _suite_options(tmp_path)
+    output = tmp_path / "evaluation"
+    chosen = {**config("candidate"), "responses": {"a": "done"}}
+    with (
+        patch("personalbench.workflow.build_history", return_value=catalogue),
+        patch("personalbench.workflow.curate_benchmark", return_value=catalogue),
+    ):
+        evaluate_history(output, chosen, **kwargs)
+    before = (output / "workflow.json").read_bytes()
+    with pytest.raises(ValueError, match="explicit preparation refresh"):
+        evaluate_history(output, chosen, resume=True, clear_variants=True, **kwargs)
+    with pytest.raises(ValueError, match="cannot supply"):
+        evaluate_history(
+            output,
+            chosen,
+            resume=True,
+            refresh_preparation=True,
+            clear_variants=True,
+            simulation_variants=_suite_variant(catalogue),
+            **kwargs,
+        )
+    assert (output / "workflow.json").read_bytes() == before

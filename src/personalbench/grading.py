@@ -98,6 +98,14 @@ def grade(
                 raise ValueError("Criterion weights must be finite and positive")
             weights[cid] = weight
             kind = item.get("kind")
+            if kind == "environment_state":
+                from .environment_grading import check_environment_state
+
+                passed, evidence = check_environment_state(
+                    item.get("value"), attempt.get("environment")
+                )
+                rows.append({"id": cid, "score": float(passed), "kind": kind, "evidence": evidence})
+                continue
             if workspace is None and (
                 kind in {"command", "file_contains"} or item.get("target", "output") != "output"
             ):
@@ -163,6 +171,7 @@ def grade(
                     {
                         "task_brief": task.get("brief", ""),
                         "inputs": task.get("inputs", {}),
+                        "simulated_environment_evidence": attempt.get("environment"),
                         "criteria": pending,
                     },
                     ensure_ascii=False,

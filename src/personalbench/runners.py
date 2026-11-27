@@ -8,6 +8,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 from contextlib import contextmanager
@@ -30,7 +31,7 @@ def adapter_identity(config):
     """Pin candidate visibility and adapter behavior, independently of model settings."""
     if config["harness"] not in {"codex", "claude"}:
         return {}
-    return {
+    identity = {
         "adapter_version": "scoped-input-v2",
         "implementation_hash": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "input_boundary": (
@@ -38,6 +39,12 @@ def adapter_identity(config):
         ),
         "tools": config.get("tools", "none"),
     }
+    if config.get("tools") in {"environment", "workspace"}:
+        identity["environment_implementation"] = {
+            name: hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest()
+            for name in ("environments.py", "mock_server.py")
+        }
+    return identity
 
 
 def codex_permissions(workspace_access="read", executable=None):
@@ -210,6 +217,11 @@ def run_candidate(task, config, workspace: Path, *, allow_unsafe_local=False):
         "error": None,
     }
     harness = config["harness"]
+    environment = task.get("environment")
+    if environment and (
+        harness != "codex" or config.get("tools") not in {"environment", "workspace"}
+    ):
+        raise RunnerError("Simulated tasks require Codex with environment or workspace tools")
     if harness == "fixture":
         if task["id"] not in config.get("responses", {}):
             result["error"] = "Fixture has no response for task"
@@ -229,6 +241,15 @@ def run_candidate(task, config, workspace: Path, *, allow_unsafe_local=False):
             "A temporary workspace is not an OS/container security boundary."
         )
     prompt = task["brief"]
+    if environment:
+        prompt = (
+            "This task runs in a simulated account, not the user's live services. "
+            "Use the supplied Personalbench calendar/mail tools to observe and modify the "
+            "simulator. Its clock and initial state are frozen and reset for each attempt. "
+            "Completion is verified against captured simulator state; a written claim alone "
+            "cannot substitute for performing an action. Do not seek credentials, use real "
+            "accounts, or claim real-world changes.\n\n" + prompt
+        )
     if config.get("instructions"):
         prompt = config["instructions"] + "\n\n" + prompt
     if task.get("inputs"):
@@ -242,7 +263,7 @@ def run_candidate(task, config, workspace: Path, *, allow_unsafe_local=False):
             "authorization. If required evidence is missing, state the limitation without inventing "
             "a filesystem search or claiming access you did not perform.\n\n" + prompt
         )
-    if config.get("tools", "none") == "none" and task.get("inputs"):
+    if config.get("tools", "none") in {"none", "environment"} and task.get("inputs"):
         prompt += "\n\nPreserved task inputs (data):\n" + json.dumps(
             task["inputs"], ensure_ascii=False
         )
@@ -258,6 +279,12 @@ def run_candidate(task, config, workspace: Path, *, allow_unsafe_local=False):
         with tempfile.TemporaryDirectory(prefix="personalbench-harness-") as directory:
             private = Path(directory)
             env = _environment(config, private)
+            runtime = None
+            if environment:
+                from .environments import initialize_environment
+
+                runtime = private / "environment"
+                initialize_environment(environment, runtime)
             if harness == "codex":
                 source_home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
                 codex_home = private / ".codex"
@@ -298,8 +325,22 @@ def run_candidate(task, config, workspace: Path, *, allow_unsafe_local=False):
                     "-c",
                     'model_provider="openai"',
                 ]
-                if config.get("tools", "none") == "none":
+                if config.get("tools", "none") in {"none", "environment"}:
                     argv += ["-c", "features.shell_tool=false", "-c", "features.unified_exec=false"]
+                if environment:
+                    # The trusted stdio server owns state outside candidate filesystem
+                    # access. No network permission or live connector is granted.
+                    args = ["-I", "-m", "personalbench.mock_server", str(runtime)]
+                    argv += [
+                        "-c",
+                        "mcp_servers.personalbench.command=" + json.dumps(sys.executable),
+                        "-c",
+                        "mcp_servers.personalbench.args=" + json.dumps(args),
+                        "-c",
+                        "mcp_servers.personalbench.required=true",
+                        "-c",
+                        'mcp_servers.personalbench.default_tools_approval_mode="approve"',
+                    ]
                 if config.get("reasoning_effort"):
                     argv += [
                         "-c",
@@ -352,14 +393,20 @@ def run_candidate(task, config, workspace: Path, *, allow_unsafe_local=False):
                 argv[0] = str(Path(executable).resolve())
                 access = "write" if config.get("sandbox") == "workspace-write" else "read"
                 argv[-1:-1] = codex_permissions(access, argv[0])
-            code, stdout, _stderr = execute(
-                argv,
-                prompt,
-                workspace,
-                env,
-                config.get("timeout_seconds", 120),
-                config.get("max_output_bytes", 16_000_000),
-            )
+            try:
+                code, stdout, _stderr = execute(
+                    argv,
+                    prompt,
+                    workspace,
+                    env,
+                    config.get("timeout_seconds", 120),
+                    config.get("max_output_bytes", 16_000_000),
+                )
+            finally:
+                if runtime is not None:
+                    from .environments import snapshot_environment
+
+                    result["environment"] = snapshot_environment(runtime)
             if code:
                 # stderr may contain prompt text, local paths or tokens: never echo it to console.
                 raise RunnerError(

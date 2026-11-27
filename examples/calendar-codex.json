@@ -1,0 +1,8 @@
+{
+  "name": "Codex simulated calendar",
+  "harness": "codex",
+  "model": "gpt-6.1-sol",
+  "tools": "environment",
+  "sandbox": "read-only",
+  "timeout_seconds": 180
+}

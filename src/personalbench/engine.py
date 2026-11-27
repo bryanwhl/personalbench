@@ -127,6 +127,7 @@ def _evaluate(
     # Candidate transmission excludes historical answers and grading criteria.
     if baseline_type == "fresh":
         assert_no_secrets([{k: t.get(k) for k in ("brief", "inputs")} for t in benchmark["tasks"]])
+        assert_no_secrets([t.get("environment") for t in benchmark["tasks"]])
     output = private_directory(output)
     path = output / "report.json"
     sources = implementation_sources()
@@ -227,6 +228,8 @@ def _evaluate(
     effective = dict(benchmark, repeats=repeats)
     if "history" in benchmark:
         report["history"] = benchmark["history"]
+    if "suite" in benchmark:
+        report["suite"] = benchmark["suite"]
     started = time.monotonic()
     previous_elapsed = report.get("elapsed_seconds", 0)
     deadline = started + max(0, max_total_seconds - previous_elapsed)
