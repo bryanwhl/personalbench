@@ -690,6 +690,7 @@ def test_failed_global_curator_blocks_candidates_and_resume_uses_compilation_and
                         "label": task["brief"],
                         "reason": "Stack LIFO and queue FIFO are distinct operations",
                         "member_ids": [task["task_id"]],
+                        "representative_candidate_ids": [task["task_id"]],
                     }
                     for task in descriptors
                 ]

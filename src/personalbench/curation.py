@@ -12,7 +12,7 @@ from pathlib import Path
 from .privacy import assert_no_secrets, private_directory, read_json, write_json
 from .schema import canonical_hash, validate_benchmark
 
-CURATION_VERSION = "global-semantic-families-v2"
+CURATION_VERSION = "global-semantic-families-v3"
 _VALIDITY_IDS = {"personalbench-validity-v1"}
 _DAILY = re.compile(r"\b(?:morning|daily)\s+brief(?:ing)?\b", re.IGNORECASE)
 _POLICY = (
@@ -28,7 +28,19 @@ _POLICY = (
     "distinct. Explaining MLX and explaining GRPO are different families. Fixing two different "
     "bugs/features in one repository is different work; 'same project', 'both coding', or 'both "
     "explanations' is not an equivalence reason. Consolidate aggressively when the actual work "
-    "is equivalent, without erasing these meaningful differences. Do not select easier cases, "
+    "is equivalent, without erasing these meaningful differences. Also consolidate a repeated "
+    "narrower request when ALL of its requested outcomes are already covered by a fuller version "
+    "of the SAME technical task: extra clarifications or surrounding explanation must not hide "
+    "the same question copied into another chat. For example, explaining reviewer attribution "
+    "and both callers of a normalization helper is covered by a fuller explanation of that same "
+    "helper and review that explicitly addresses both questions. Explain the containment in the "
+    "family reason. Mere topical overlap, shared context, or a task mentioning another task is "
+    "insufficient; keep separately requested operations, distinct bugs/features, and independent "
+    "deliverables separate. For each family, representative_candidate_ids must list only member "
+    "IDs whose own unchanged requirements cover ALL outcomes in that family; for containment "
+    "exclude the narrower members. Include all equivalent full-coverage members, with at least "
+    "one. Do not use readiness, evidence availability, answers or scores to determine coverage. "
+    "Do not select easier cases, "
     "invent goals, rewrite requirements, merge source inputs, or use outcomes to group tasks. "
     "Each returned family needs a concise label and a specific reason explaining its common "
     "objective/operation/constraints or why its singleton is distinct. Return exactly the requested "
@@ -41,7 +53,7 @@ _GLOBAL_INSTRUCTION = (
     "Every ORIGINAL task ID must occur once in the final partition. Explicitly "
     "acknowledge every proposal ID in audit.compared_proposal_ids.\n"
 )
-_FAMILY_SCHEMA = '{"families":[{"label":"specific operation","reason":"why equivalent or distinct","member_ids":["task-id"]}]'
+_FAMILY_SCHEMA = '{"families":[{"label":"specific operation","reason":"why equivalent or distinct","member_ids":["task-id"],"representative_candidate_ids":["full-coverage-task-id"]}]'
 _AUDIT_SCHEMA = (
     ',"audit":{"compared_proposal_ids":["proposal-id"],"rationale":"cross-family redundancy audit"}'
 )
@@ -213,6 +225,17 @@ def _validate_partition(response, expected, daily_ids, *, proposal_ids=None):
             raise ValueError(
                 "Every family needs a specific label and equivalence/distinction reason"
             )
+        candidates = family.get("representative_candidate_ids")
+        if (
+            not isinstance(candidates, list)
+            or not candidates
+            or any(not isinstance(candidate, str) for candidate in candidates)
+            or len(candidates) != len(set(candidates))
+            or not set(candidates) <= set(members)
+        ):
+            raise ValueError(
+                "Every family needs nonempty unique full-coverage representative_candidate_ids from its members"
+            )
         if set(members) & daily_ids and not set(members) <= daily_ids:
             raise ValueError(
                 "Personal daily briefs cannot be grouped with other operations such as building automation"
@@ -223,6 +246,7 @@ def _validate_partition(response, expected, daily_ids, *, proposal_ids=None):
                 "label": family["label"].strip(),
                 "reason": family["reason"].strip(),
                 "member_ids": sorted(members),
+                "representative_candidate_ids": sorted(candidates),
             }
         )
     if len(seen) != len(set(seen)) or set(seen) != set(expected):
@@ -246,17 +270,10 @@ def _validate_partition(response, expected, daily_ids, *, proposal_ids=None):
             raise ValueError(
                 "Global redundancy audit must acknowledge every proposal ID exactly once with rationale"
             )
-    # Enforce the user's recurrence policy even if a model needlessly splits dates.
+    # Require one recurrence family without overriding full-coverage eligibility.
     daily = [family for family in families if set(family["member_ids"]) & daily_ids]
-    if daily:
-        families = [family for family in families if not set(family["member_ids"]) & daily_ids]
-        families.append(
-            {
-                "label": "Personal calendar and email daily brief",
-                "reason": "Same recurring calendar/email briefing operation; dates, people, snapshots and source availability are incidental by the user's deduplication policy.",
-                "member_ids": sorted(daily_ids),
-            }
-        )
+    if len(daily) > 1:
+        raise ValueError("All personal calendar/email daily briefs must form one family")
     return sorted(families, key=lambda family: family["member_ids"])
 
 
@@ -426,6 +443,7 @@ def curate_benchmark(
                     "label": "Personal calendar and email daily brief",
                     "reason": "User mandates one recurrence family regardless of source date or availability.",
                     "member_ids": sorted(daily_ids),
+                    "representative_candidate_ids": sorted(daily_ids),
                 }
             )
         remaining = [
@@ -447,6 +465,7 @@ def curate_benchmark(
                         "label": batch[0]["brief"][:100],
                         "reason": "Singleton local proposal; global audit must still compare it.",
                         "member_ids": [batch[0]["task_id"]],
+                        "representative_candidate_ids": [batch[0]["task_id"]],
                     }
                 )
             else:
@@ -459,7 +478,7 @@ def curate_benchmark(
                 )
         for proposal in proposals:
             proposal["proposal_id"] = "proposal-" + canonical_hash(proposal["member_ids"])[:16]
-        if len(proposals) == 1 and (len(by_id) == 1 or daily_ids == set(by_id)):
+        if len(by_id) == 1:
             families = [{key: value for key, value in proposals[0].items() if key != "proposal_id"}]
             audit = {
                 "method": "deterministic_single_family",
@@ -495,7 +514,7 @@ def curate_benchmark(
         family_audit = []
         for family in families:
             members = family["member_ids"]
-            representative = _representative(members, by_id)
+            representative = _representative(family["representative_candidate_ids"], by_id)
             selected.append(copy.deepcopy(by_id[representative]))
             family_audit.append(
                 {
@@ -503,7 +522,7 @@ def curate_benchmark(
                     "family_id": "family-" + canonical_hash(members)[:16],
                     "representative_task_id": representative,
                     "selection": {
-                        "policy": "Pre-execution readiness, complete evidence and constraint richness; never answers, grades or success.",
+                        "policy": "Full requirement coverage first; then pre-execution readiness, complete evidence and constraint richness; never answers, grades or success.",
                         "cases": {
                             member: _representative_details(by_id[member])[1] for member in members
                         },
