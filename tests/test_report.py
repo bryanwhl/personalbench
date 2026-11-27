@@ -16,6 +16,13 @@ class TagParser(HTMLParser):
 
 
 class ReportTests(unittest.TestCase):
+    def test_assessment_refresh_is_distinguished_from_new_candidate_execution(self):
+        rendered = render_report(
+            {"assessment_revisions": [{"source_snapshot": "<script>bad</script>"}]}
+        )
+        self.assertIn("No replacement candidate answers were generated", rendered)
+        self.assertNotIn("<script>", rendered)
+
     def test_simulation_provenance_and_trusted_state_are_visible(self):
         result = render_report(
             {

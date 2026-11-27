@@ -63,6 +63,7 @@ def evaluate_history(
     stop_after_cost_usd: float | None = None,
     resume: bool = False,
     refresh_preparation: bool = False,
+    refresh_assessments: bool = False,
     allow_unsafe_local: bool = False,
     progress=None,
 ):
@@ -71,6 +72,8 @@ def evaluate_history(
     Preparation and execution have separate explicit budgets. Missing historical data is
     an audited coverage gap; model execution or preparation errors remain visible.
     """
+    if refresh_assessments and (not resume or refresh_preparation):
+        raise ValueError("Assessment refresh requires plain --resume without preparation refresh")
     if not isinstance(clear_variants, bool):
         raise TypeError("clear_variants must be boolean")
     if clear_variants and (not resume or simulation_variants is not None):
@@ -547,6 +550,7 @@ def evaluate_history(
             workers=workers,
             progress=progress,
             resume=resume and report_path.exists(),
+            refresh_assessments=refresh_assessments,
             allow_unsafe_local=allow_unsafe_local,
             max_total_seconds=max_total_seconds,
             stop_after_cost_usd=stop_after_cost_usd,

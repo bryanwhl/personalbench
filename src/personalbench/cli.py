@@ -140,6 +140,11 @@ def parser():
     )
     flow.add_argument("--resume", action="store_true")
     flow.add_argument(
+        "--refresh-assessments",
+        action="store_true",
+        help="Reassess saved attempts after a grader fix without rerunning candidates",
+    )
+    flow.add_argument(
         "--refresh-preparation",
         action="store_true",
         help="Reaudit frozen inputs after fixes; preserve older benchmark/run revisions",
@@ -172,6 +177,11 @@ def parser():
         )
         _model_options(run)
         if name == "run":
+            run.add_argument(
+                "--refresh-assessments",
+                action="store_true",
+                help="Reassess saved attempts after a grader fix without rerunning candidates",
+            )
             run.add_argument("--config", required=True)
             run.add_argument("--repeats", type=int, default=1)
     compare = sub.add_parser(
@@ -267,6 +277,7 @@ def main(argv=None):
                 stop_after_cost_usd=args.stop_after_cost_usd,
                 resume=args.resume,
                 refresh_preparation=args.refresh_preparation,
+                refresh_assessments=args.refresh_assessments,
                 allow_unsafe_local=args.allow_unsafe_local,
                 progress=lambda event: print(json.dumps(event), file=sys.stderr),
             )
@@ -450,6 +461,7 @@ def main(argv=None):
                 judge_config=read_json(Path(args.judge)) if args.judge else None,
                 repeats=getattr(args, "repeats", 1),
                 baseline_type="fresh" if args.action == "run" else "recorded",
+                refresh_assessments=getattr(args, "refresh_assessments", False),
                 resume=args.resume,
                 workers=args.workers,
                 allow_unsafe_local=args.allow_unsafe_local,

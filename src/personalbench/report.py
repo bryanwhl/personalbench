@@ -117,6 +117,16 @@ def render_report(report: dict) -> str:
         )
     curation_section = ""
     suite_section = ""
+    assessment_section = ""
+    if report.get("assessment_revisions"):
+        assessment_section = (
+            "<section><h2>Assessment refresh</h2><p>Saved candidate outputs were reassessed "
+            "after a grader implementation change. No replacement candidate answers were generated; "
+            "prior grades and execution measurements remain in the immutable source report.</p>"
+            "<details><summary>Grading policy revisions</summary><pre>"
+            + _json(report["assessment_revisions"])
+            + "</pre></details></section>"
+        )
     suite = report.get("suite")
     if isinstance(suite, dict):
         origins = suite.get("origin_counts", {})
@@ -323,6 +333,7 @@ Complete tasks: {_escape(coverage.get("complete_tasks", 0))}/{_escape(coverage.g
 <p class="muted">Unavailable means evidence is missing. Missing results never count as passing results.</p></section>
 {observed_note}
 {suite_section}
+{assessment_section}
 {history_section}
 {curation_section}
 <section><h2>Results by task</h2><div class="table-wrap"><table><caption>Tasks have equal weight in the headline scores.</caption>

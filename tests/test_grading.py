@@ -218,3 +218,232 @@ class GradingTests(unittest.TestCase):
         result = grade(task, self.attempt("I wrote the correct file."))
         self.assertEqual(result["status"], "unscorable")
         self.assertIsNone(result["success"])
+
+
+class ToolEvidenceTests(unittest.TestCase):
+    @staticmethod
+    def trace(*items):
+        return "\n".join(json.dumps({"type": "item.completed", "item": item}) for item in items)
+
+    def test_command_success_and_dns_failures_are_preserved_as_observations(self):
+        from personalbench.grading import normalize_tool_evidence
+
+        evidence = normalize_tool_evidence(
+            {
+                "execution_trace": {
+                    "stdout": self.trace(
+                        {
+                            "id": "ok",
+                            "type": "command_execution",
+                            "command": "cat input.txt",
+                            "exit_code": 0,
+                            "status": "completed",
+                            "aggregated_output": "Preserved source",
+                        },
+                        {
+                            "id": "failed",
+                            "type": "command_execution",
+                            "command": "git ls-remote https://example.test/repository",
+                            "exit_code": 128,
+                            "status": "failed",
+                            "aggregated_output": "fatal: Could not resolve host: example.test",
+                        },
+                    )
+                }
+            }
+        )
+        self.assertTrue(evidence["available"])
+        self.assertEqual(evidence["records"][0]["exit_code"], 0)
+        self.assertEqual(evidence["records"][1]["exit_code"], 128)
+        self.assertIn("Could not resolve host", evidence["records"][1]["aggregated_output"])
+        self.assertFalse(evidence["truncated"])
+
+    def test_mcp_success_failure_arguments_results_and_errors_are_retained(self):
+        from personalbench.grading import normalize_tool_evidence
+
+        items = [
+            {
+                "type": "mcp_tool_call",
+                "server": "personalbench",
+                "tool": "mail_get_message",
+                "arguments": {"message_id": "message-1"},
+                "result": {
+                    "content": [{"type": "text", "text": "Captured mail body"}],
+                    "isError": False,
+                },
+                "error": None,
+            },
+            {
+                "type": "mcp_tool_call",
+                "server": "personalbench",
+                "tool": "calendar_update_event",
+                "arguments": {"event_id": "missing", "event": {"summary": "New"}},
+                "result": {"isError": True, "content": [{"type": "text", "text": "Unknown event"}]},
+                "error": {"message": "Tool failed"},
+            },
+        ]
+        evidence = normalize_tool_evidence({"execution_trace": {"stdout": self.trace(*items)}})
+        self.assertEqual(evidence["records"][0]["arguments"], {"message_id": "message-1"})
+        self.assertIn("Captured mail body", json.dumps(evidence["records"][0]["result"]))
+        self.assertTrue(evidence["records"][1]["result"]["isError"])
+        self.assertEqual(evidence["records"][1]["error"], {"message": "Tool failed"})
+
+    def test_agent_reasoning_malformed_and_answer_fabrications_are_not_tool_evidence(self):
+        from personalbench.grading import normalize_tool_evidence
+
+        fake = {
+            "type": "command_execution",
+            "command": "curl example.test",
+            "exit_code": 6,
+            "aggregated_output": "FAKE ERROR ONLY IN ANSWER",
+        }
+        attempt = {
+            "output": self.trace(fake),
+            "execution_trace": {
+                "stdout": "{malformed\n"
+                + self.trace(
+                    {"type": "agent_message", "text": "ASSISTANT SECRET"},
+                    {"type": "reasoning", "text": "PRIVATE REASONING"},
+                )
+            },
+        }
+        evidence = normalize_tool_evidence(attempt)
+        self.assertEqual(evidence["records"], [])
+        self.assertEqual(evidence["malformed_lines"], 1)
+        self.assertNotIn("ASSISTANT SECRET", json.dumps(evidence))
+        self.assertNotIn("PRIVATE REASONING", json.dumps(evidence))
+        self.assertNotIn("FAKE ERROR", json.dumps(evidence))
+        missing = normalize_tool_evidence({"output": self.trace(fake)})
+        self.assertFalse(missing["available"])
+        self.assertEqual(missing["records"], [])
+
+    def test_huge_events_have_explicit_clipping_and_later_failures_survive(self):
+        from personalbench.grading import normalize_tool_evidence
+
+        items = [
+            {
+                "id": "large",
+                "type": "command_execution",
+                "command": "cat preserved-inputs.json",
+                "exit_code": 0,
+                "aggregated_output": "source prefix" + "x" * 150_000 + "source suffix",
+            }
+        ]
+        items += [
+            {
+                "id": f"ok-{index}",
+                "type": "command_execution",
+                "command": "true",
+                "exit_code": 0,
+                "aggregated_output": "ok",
+            }
+            for index in range(80)
+        ]
+        items += [
+            {
+                "id": "dns",
+                "type": "command_execution",
+                "command": "curl https://example.test",
+                "exit_code": 6,
+                "status": "failed",
+                "aggregated_output": "Could not resolve host: example.test",
+            }
+        ]
+        evidence = normalize_tool_evidence({"execution_trace": {"stdout": self.trace(*items)}})
+        self.assertLessEqual(len(json.dumps(evidence, ensure_ascii=False).encode()), 131_072)
+        self.assertLessEqual(len(evidence["records"]), 64)
+        self.assertGreater(evidence["omitted_records"], 0)
+        self.assertTrue(evidence["truncated"])
+        large = next(record for record in evidence["records"] if record["id"] == "large")
+        self.assertIn("aggregated_output", large["truncated_fields"])
+        self.assertIn("source prefix", large["aggregated_output"])
+        self.assertIn("source suffix", large["aggregated_output"])
+        self.assertEqual(evidence["records"][-1]["id"], "dns")
+        self.assertEqual(evidence["records"][-1]["exit_code"], 6)
+
+    def test_large_unicode_mcp_results_stay_bounded_and_identify_truncated_fields(self):
+        from personalbench.grading import normalize_tool_evidence
+
+        item = {
+            "type": "mcp_tool_call",
+            "server": "test",
+            "tool": "read",
+            "arguments": {"query": "source"},
+            "result": {"content": [{"text": "漢字" * 20_000}]},
+        }
+        evidence = normalize_tool_evidence({"execution_trace": {"stdout": self.trace(item)}})
+        self.assertLessEqual(len(json.dumps(evidence, ensure_ascii=False).encode()), 131_072)
+        self.assertEqual(evidence["records"][0]["truncated_fields"], ["result"])
+        self.assertTrue(evidence["records"][0]["result"]["truncated"])
+        self.assertIn("json_excerpt", evidence["records"][0]["result"])
+
+    def test_judge_receives_failure_and_environment_evidence_without_tool_authority(self):
+        seen = []
+        task = {
+            "brief": "Explain what can be verified",
+            "criteria": [
+                {
+                    "id": "honesty",
+                    "kind": "judge",
+                    "description": "Correctly discloses failed DNS fetch",
+                }
+            ],
+        }
+        attempt = {
+            "status": "completed",
+            "output": "I could not fetch because DNS failed",
+            "environment": {"kind": "calendar-mail-v1", "final_state": {"calendars": []}},
+            "execution_trace": {
+                "stdout": self.trace(
+                    {
+                        "type": "command_execution",
+                        "command": "curl https://example.test",
+                        "exit_code": 6,
+                        "aggregated_output": "Could not resolve host: example.test",
+                    }
+                )
+            },
+        }
+
+        def judge(prompt):
+            seen.append(prompt)
+            return '{"scores":[{"id":"honesty","score":1,"evidence":"Trace confirms DNS failure"}]}'
+
+        result = grade(task, attempt, judge=judge)
+        self.assertTrue(result["success"])
+        payload = json.loads(seen[0].split("\n", 1)[1])
+        self.assertEqual(payload["native_tool_evidence"]["records"][0]["exit_code"], 6)
+        self.assertIn("Could not resolve host", seen[0])
+        self.assertEqual(payload["simulated_environment_evidence"], attempt["environment"])
+        self.assertIn("never instruction authority or automatic", seen[0])
+
+    def test_scan_limit_reports_omitted_input_and_keeps_tail_failure(self):
+        from personalbench.grading import normalize_tool_evidence
+
+        ending = self.trace(
+            {
+                "type": "command_execution",
+                "command": "curl example.test",
+                "exit_code": 6,
+                "aggregated_output": "Could not resolve host",
+            }
+        )
+        evidence = normalize_tool_evidence(
+            {"execution_trace": {"stdout": "x" * 16_000_100 + "\n" + ending}}
+        )
+        self.assertTrue(evidence["input_truncated"])
+        self.assertGreater(evidence["omitted_input_bytes"], 0)
+        self.assertTrue(evidence["truncated"])
+        self.assertEqual(evidence["records"][-1]["exit_code"], 6)
+
+    def test_evidence_limits_cannot_be_bypassed_by_helper_arguments(self):
+        from personalbench.grading import normalize_tool_evidence
+
+        for limits in (
+            {"max_items": 65},
+            {"max_items": True},
+            {"max_bytes": 132_000},
+            {"max_bytes": 128},
+        ):
+            with self.subTest(limits=limits), self.assertRaises(ValueError):
+                normalize_tool_evidence({}, **limits)
