@@ -373,7 +373,7 @@ def evaluate_history(
                 manifest.pop("reused_evidence_from", None)
                 if (run_directory / "report.json").exists():
                     previous_report = read_json(run_directory / "report.json")
-                    if previous_report.get("run_status") == "complete":
+                    if previous_report.get("run_status") in {"complete", "interrupted"}:
                         reuse_report = run_directory / "report.json"
                         reuse_benchmark = benchmark_path
                         manifest["reused_evidence_from"] = {

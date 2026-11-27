@@ -79,6 +79,38 @@ def test_revision_reuses_success_and_failure_and_only_executes_new_ready_goal(tm
         evaluate(bench(True), config(), tmp_path / "new", resume=True)
 
 
+def test_revision_preserves_scored_success_and_failure_after_safe_interruption(tmp_path):
+    original = bench(True)
+    source_benchmark = tmp_path / "original.json"
+    write_json(source_benchmark, original)
+
+    def interrupted(task, *args, **kwargs):
+        if task["id"] == "c":
+            raise KeyboardInterrupt
+        return run_candidate(task, *args, **kwargs)
+
+    with (
+        patch("personalbench.engine.run_candidate", side_effect=interrupted),
+        pytest.raises(KeyboardInterrupt),
+    ):
+        evaluate(original, config(), tmp_path / "previous")
+    source_report = tmp_path / "previous/report.json"
+    assert json.loads(source_report.read_text())["run_status"] == "interrupted"
+    revised = dict(original, name="Curated revision")
+    with patch("personalbench.engine.run_candidate", wraps=run_candidate) as runner:
+        result = evaluate(
+            revised,
+            config(),
+            tmp_path / "new",
+            reuse_report=source_report,
+            reuse_benchmark=source_benchmark,
+        )
+    assert [call.args[0]["id"] for call in runner.call_args_list] == ["c"]
+    assert result["reuse"]["reused_trials"] == 2
+    assert result["trials"][1]["grading"]["success"] is False
+    assert result["run_status"] == "complete"
+
+
 @pytest.mark.parametrize("field", ["inputs", "criteria", "reference", "execution_requirements"])
 def test_actual_task_change_prevents_reuse_even_if_id_is_unchanged(tmp_path, field):
     source_benchmark, source_report, _ = previous(tmp_path)
