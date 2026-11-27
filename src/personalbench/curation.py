@@ -12,7 +12,7 @@ from pathlib import Path
 from .privacy import assert_no_secrets, private_directory, read_json, write_json
 from .schema import canonical_hash, validate_benchmark
 
-CURATION_VERSION = "global-semantic-families-v3"
+CURATION_VERSION = "global-semantic-families-v4"
 _VALIDITY_IDS = {"personalbench-validity-v1"}
 _DAILY = re.compile(r"\b(?:morning|daily)\s+brief(?:ing)?\b", re.IGNORECASE)
 _POLICY = (
@@ -36,7 +36,14 @@ _POLICY = (
     "helper and review that explicitly addresses both questions. Explain the containment in the "
     "family reason. Mere topical overlap, shared context, or a task mentioning another task is "
     "insufficient; keep separately requested operations, distinct bugs/features, and independent "
-    "deliverables separate. For each family, representative_candidate_ids must list only member "
+    "deliverables separate. Do not split a routine integration operation by item count or the "
+    "source supplying the same required fields. In particular, creating calendar events from "
+    "one linked email, several scheduling messages, or supplied booking details is ONE reusable "
+    "calendar-event creation family. Timezone, location, duration assumptions, confirmation, "
+    "duplicate/conflict checks and resolving changed scheduling details are covered by the fuller "
+    "event-creation task; they must not turn its narrower variants into separate families. "
+    "Building a calendar integration, implementing a new API, or a different requested calendar "
+    "operation remains distinct. For each family, representative_candidate_ids must list only member "
     "IDs whose own unchanged requirements cover ALL outcomes in that family; for containment "
     "exclude the narrower members. Include all equivalent full-coverage members, with at least "
     "one. Do not use readiness, evidence availability, answers or scores to determine coverage. "
