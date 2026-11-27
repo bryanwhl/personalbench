@@ -80,6 +80,115 @@ def _workspace(task, directory):
     return root
 
 
+def _assessment_sources(benchmark, report, repeats):
+    """Reject incomplete execution or irrecoverable grader inputs before changing a report."""
+    tasks = {task["id"]: task for task in benchmark["tasks"]}
+    known = {(task_id, repeat) for task_id in tasks for repeat in range(repeats)}
+    rows = {}
+    for row in report.get("trials", []):
+        key = (row.get("task_id"), row.get("repeat"))
+        if (
+            not isinstance(key[1], int)
+            or isinstance(key[1], bool)
+            or key not in known
+            or key in rows
+        ):
+            raise ValueError("Assessment refresh needs unambiguous saved trial identities")
+        rows[key] = row
+    for task_id, task in tasks.items():
+        if task.get("readiness", "ready") != "ready":
+            continue
+        for repeat in range(repeats):
+            row = rows.get((task_id, repeat))
+            if row is None or row.get("status") not in {"completed", "budget_exceeded"}:
+                raise ValueError(
+                    "Assessment refresh requires every ready candidate to have completed execution"
+                )
+            if row["status"] == "budget_exceeded":
+                grading = row.get("grading", {})
+                if (
+                    grading.get("status") != "scored"
+                    or grading.get("quality_pct") != 0
+                    or grading.get("success") is not False
+                ):
+                    raise ValueError(
+                        "Assessment refresh requires terminal timeout failures to retain their zero grade"
+                    )
+                continue
+            if any(criterion["kind"] == "command" for criterion in task["criteria"]):
+                raise ValueError("Assessment refresh cannot restore arbitrary command grader state")
+            if not isinstance(row.get("output"), str):
+                raise ValueError("Assessment refresh needs captured candidate output")  # noqa: TRY004
+            artifacts = row.get("artifacts", {})
+            if not isinstance(artifacts, dict):
+                raise ValueError("Assessment refresh needs captured artifact mappings")  # noqa: TRY004
+            for criterion in task["criteria"]:
+                target = criterion.get("target", "output")
+                if target != "output" and not isinstance(artifacts.get(target), str):
+                    raise ValueError(
+                        "Assessment refresh cannot restore an uncaptured required artifact"
+                    )
+                if criterion["kind"] == "environment_state" and not isinstance(
+                    row.get("environment"), dict
+                ):
+                    raise ValueError(
+                        "Assessment refresh cannot restore an uncaptured environment snapshot"
+                    )
+
+
+def _refresh_assessment_policy(benchmark, report, policy, output, repeats):
+    old = report.get("scoring_policy", {})
+    if canonical_hash(old) != report.get("scoring_hash"):
+        raise ValueError("Assessment refresh needs a consistent saved scoring policy hash")
+    if {key: value for key, value in old.items() if key != "grader_implementation"} != {
+        key: value for key, value in policy.items() if key != "grader_implementation"
+    }:
+        raise ValueError("Assessment refresh cannot change judge or scoring configuration")
+    if old.get("grader_implementation", {}).get("scoring.py") != policy[
+        "grader_implementation"
+    ].get("scoring.py"):
+        raise ValueError("Assessment refresh cannot change scoring aggregation")
+    if report.get("summary") != summarize(dict(benchmark, repeats=repeats), report["trials"]):
+        raise ValueError("Assessment refresh needs a reproducible saved summary")
+    _assessment_sources(benchmark, report, repeats)
+    raw = (output / "report.json").read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    backup = output / "assessment-revisions" / f"report-{digest}.json"
+    private_directory(backup.parent)
+    if backup.is_symlink():
+        raise ValueError("Assessment revision snapshots cannot follow symbolic links")
+    if backup.exists():
+        if backup.read_bytes() != raw:
+            raise ValueError("Assessment revision snapshot changed unexpectedly")
+    else:
+        write_private(backup, raw.decode("utf-8"))
+    report.setdefault("assessment_revisions", []).append(
+        {
+            "at": datetime.now(UTC).isoformat(),
+            "previous_scoring_hash": report["scoring_hash"],
+            "current_scoring_hash": canonical_hash(policy),
+            "source_snapshot": str(backup),
+            "source_snapshot_sha256": digest,
+            "rule": "Reassess every completed outcome, including passes and failures; never rerun candidates or alter terminal timeouts.",
+        }
+    )
+    ready = {task["id"] for task in benchmark["tasks"] if task.get("readiness", "ready") == "ready"}
+    for row in report["trials"]:
+        if row["task_id"] in ready and row["status"] == "completed":
+            row["assessment_refresh_pending"] = True
+            row["grading"] = {
+                "status": "pending",
+                "quality_pct": None,
+                "success": None,
+                "criteria": [],
+                "error": "Assessment refresh pending under the new grader implementation",
+            }
+    report.update(
+        scoring_policy=policy, scoring_hash=canonical_hash(policy), assessment_refresh_pending=True
+    )
+    return report
+
+
 def _evaluate(
     benchmark,
     configuration,
@@ -96,7 +205,12 @@ def _evaluate(
     progress=None,
     reuse_report=None,
     reuse_benchmark=None,
+    refresh_assessments=False,
 ):
+    if not isinstance(refresh_assessments, bool):
+        raise TypeError("refresh_assessments must be boolean")
+    if refresh_assessments and (not resume or baseline_type != "fresh"):
+        raise ValueError("Assessment refresh requires resume of fresh candidate evidence")
     if (reuse_report is None) != (reuse_benchmark is None):
         raise ValueError("Evidence reuse requires both previous report and full benchmark")
     validate_benchmark(benchmark)
@@ -127,6 +241,7 @@ def _evaluate(
     # Candidate transmission excludes historical answers and grading criteria.
     if baseline_type == "fresh":
         assert_no_secrets([{k: t.get(k) for k in ("brief", "inputs")} for t in benchmark["tasks"]])
+        assert_no_secrets([t.get("environment") for t in benchmark["tasks"]])
     output = private_directory(output)
     path = output / "report.json"
     sources = implementation_sources()
@@ -167,14 +282,25 @@ def _evaluate(
             raise ValueError(
                 "Cannot resume with changed benchmark, configuration, grader, repeats, or workers"
             )
+        if refresh_assessments or report.get("assessment_refresh_pending"):
+            _assessment_sources(benchmark, report, repeats)
+            if canonical_hash(report.get("scoring_policy", {})) != report.get("scoring_hash"):
+                raise ValueError("Assessment refresh needs a consistent saved scoring policy hash")
+            if report.get("summary") != summarize(
+                dict(benchmark, repeats=repeats), report["trials"]
+            ):
+                raise ValueError("Assessment refresh needs a reproducible saved summary")
         if report.get("scoring_hash") != identity["scoring_hash"]:
-            report = migrate_comparison_only_policy(
-                report,
-                policy,
-                sources["scoring.py"],
-                output,
-                summarize(dict(benchmark, repeats=repeats), report["trials"]),
-            )
+            if refresh_assessments:
+                report = _refresh_assessment_policy(benchmark, report, policy, output, repeats)
+            else:
+                report = migrate_comparison_only_policy(
+                    report,
+                    policy,
+                    sources["scoring.py"],
+                    output,
+                    summarize(dict(benchmark, repeats=repeats), report["trials"]),
+                )
     elif resume:
         raise ValueError("No run exists at this output path")
     else:
@@ -223,10 +349,13 @@ def _evaluate(
         report["warnings"].append(
             "Unchanged trial evidence was reused from the previous workflow revision, including failed outcomes. Reused evidence is not a new candidate execution."
         )
+    assessment_only = refresh_assessments or bool(report.get("assessment_refresh_pending"))
     snapshot_scoring(output, sources["scoring.py"])
     effective = dict(benchmark, repeats=repeats)
     if "history" in benchmark:
         report["history"] = benchmark["history"]
+    if "suite" in benchmark:
+        report["suite"] = benchmark["suite"]
     started = time.monotonic()
     previous_elapsed = report.get("elapsed_seconds", 0)
     deadline = started + max(0, max_total_seconds - previous_elapsed)
@@ -265,7 +394,8 @@ def _evaluate(
             row["status"] == "completed"
             and restorable
             and (
-                row.get("assessment_interrupted")
+                row.get("assessment_refresh_pending")
+                or row.get("assessment_interrupted")
                 or row.get("budget_limited")
                 or row.get("grading", {}).get("status") == "grading_error"
             )
@@ -275,6 +405,8 @@ def _evaluate(
     report.setdefault("retry_history", [])
 
     def save():
+        if not any(row.get("assessment_refresh_pending") for row in report["trials"]):
+            report.pop("assessment_refresh_pending", None)
         report["trials"].sort(key=lambda row: order[(row["task_id"], row["repeat"])])
         report["judge_calls"].sort(
             key=lambda row: order.get((row.get("task_id"), row.get("repeat")), -1)
@@ -386,6 +518,10 @@ def _evaluate(
                             )
                         grading_workspace = None
                     else:
+                        if assessment_only:
+                            raise ValueError(
+                                "Assessment-only refresh cannot execute a candidate fallback"
+                            )
                         remaining = deadline - time.monotonic()
                         if remaining < 0.1:
                             raise TrialDeferred
@@ -441,6 +577,7 @@ def _evaluate(
                             deadline=deadline,
                         )
                     attempt.pop("assessment_interrupted", None)
+                    attempt.pop("assessment_refresh_pending", None)
                     if time.monotonic() >= deadline and attempt["grading"]["status"] != "scored":
                         attempt["budget_limited"] = True
 

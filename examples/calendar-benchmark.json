@@ -1,0 +1,96 @@
+{
+  "schema_version": 1,
+  "name": "Synthetic stateful calendar example",
+  "tasks": [
+    {
+      "id": "reschedule-planning",
+      "category": "productivity",
+      "readiness": "ready",
+      "brief": "In the simulated calendar, update the existing Planning event to the latest time agreed in the email conversation. Preserve its event ID and unrelated events, avoid duplicates, and report the confirmed simulated change. Inspect the mailbox and calendar tools; do not use real accounts.",
+      "environment": {
+        "kind": "calendar-mail-v1",
+        "fixture_origin": "synthetic",
+        "now": "2026-01-15T12:00:00Z",
+        "timezone": "UTC",
+        "calendars": [
+          {
+            "id": "primary",
+            "events": [
+              {
+                "id": "planning",
+                "summary": "Planning",
+                "start": {
+                  "dateTime": "2026-01-16T15:00:00Z"
+                },
+                "end": {
+                  "dateTime": "2026-01-16T16:00:00Z"
+                }
+              },
+              {
+                "id": "check-in",
+                "summary": "Team check-in",
+                "start": {
+                  "dateTime": "2026-01-16T09:00:00Z"
+                },
+                "end": {
+                  "dateTime": "2026-01-16T09:30:00Z"
+                }
+              }
+            ]
+          }
+        ],
+        "messages": [
+          {
+            "id": "old-proposal",
+            "threadId": "planning-thread",
+            "from": "alex@example.test",
+            "to": "sam@example.test",
+            "subject": "Planning time",
+            "date": "2026-01-14T12:00:00Z",
+            "body": "Planning is currently Friday January16 at15:00UTC. Could we move it to16:00\u201317:00UTC?"
+          },
+          {
+            "id": "confirmed-time",
+            "threadId": "planning-thread",
+            "from": "sam@example.test",
+            "to": "alex@example.test",
+            "subject": "Re: Planning time",
+            "date": "2026-01-15T10:00:00Z",
+            "body": "Confirmed: Planning is Friday January16,2026 from16:00 to17:00UTC. Please update the existing calendar entry."
+          }
+        ]
+      },
+      "criteria": [
+        {
+          "id": "correct-state",
+          "kind": "environment_state",
+          "critical": true,
+          "description": "Existing Planning event moves to the agreed time, no duplicate is created, and the unrelated check-in remains unchanged.",
+          "value": {
+            "calendar_id": "primary",
+            "events": [
+              {
+                "id": "planning",
+                "summary": "Planning",
+                "start": {
+                  "dateTime": "2026-01-16T16:00:00Z"
+                },
+                "end": {
+                  "dateTime": "2026-01-16T17:00:00Z"
+                }
+              }
+            ],
+            "preserve_existing": true,
+            "no_extra_events": true
+          }
+        },
+        {
+          "id": "clear-report",
+          "kind": "contains",
+          "description": "Report identifies the updated planning event.",
+          "value": "Planning"
+        }
+      ]
+    }
+  ]
+}

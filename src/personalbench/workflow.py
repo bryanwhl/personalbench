@@ -16,7 +16,8 @@ from .history import build_history, discover_sessions, parse_as_of
 from .privacy import private_directory, read_json, write_json
 from .recovery import extract_evidence
 from .runners import adapter_identity
-from .schema import canonical_hash, validate_config
+from .schema import canonical_hash, validate_benchmark, validate_config
+from .suites import SUITE_VERSION, build_replayable_suite
 
 
 def _preparation_identity(config):
@@ -45,6 +46,9 @@ def evaluate_history(
     compiler_config: dict | None = None,
     judge_config: dict | None = None,
     curator_config: dict | None = None,
+    simulation_variants: dict | None = None,
+    replayable_suite: bool | None = None,
+    clear_variants: bool = False,
     days: int = 120,
     include_automations: bool | None = None,
     as_of: str | None = None,
@@ -59,6 +63,7 @@ def evaluate_history(
     stop_after_cost_usd: float | None = None,
     resume: bool = False,
     refresh_preparation: bool = False,
+    refresh_assessments: bool = False,
     allow_unsafe_local: bool = False,
     progress=None,
 ):
@@ -67,6 +72,12 @@ def evaluate_history(
     Preparation and execution have separate explicit budgets. Missing historical data is
     an audited coverage gap; model execution or preparation errors remain visible.
     """
+    if refresh_assessments and (not resume or refresh_preparation):
+        raise ValueError("Assessment refresh requires plain --resume without preparation refresh")
+    if not isinstance(clear_variants, bool):
+        raise TypeError("clear_variants must be boolean")
+    if clear_variants and (not resume or simulation_variants is not None):
+        raise ValueError("Clearing variants requires resume and cannot supply simulation variants")
     if refresh_preparation and not resume:
         raise ValueError("Refreshing preparation requires --resume of an existing frozen workflow")
     validate_config(configuration)
@@ -95,6 +106,26 @@ def evaluate_history(
             raise ValueError("Another process is already running this workflow") from exc
         manifest_path = output / "workflow.json"
         previous_manifest = read_json(manifest_path) if manifest_path.exists() else None
+        refreshing = refresh_preparation or bool(
+            previous_manifest and previous_manifest.get("refresh_pending")
+        )
+        if clear_variants and not refreshing:
+            raise ValueError("Clearing variants requires explicit preparation refresh")
+        variants_path = output / "simulation-variants.json"
+        frozen_variants_hash = (
+            previous_manifest["identity"].get("variants_hash")
+            if previous_manifest and resume
+            else None
+        )
+        if simulation_variants is None and frozen_variants_hash is not None and not clear_variants:
+            try:
+                simulation_variants = read_json(variants_path)
+            except (OSError, ValueError) as exc:
+                raise ValueError("Frozen simulation variants are missing or invalid") from exc
+            if canonical_hash(simulation_variants) != frozen_variants_hash:
+                raise ValueError("Frozen simulation variants hash does not match workflow identity")
+        if simulation_variants is not None:
+            validate_benchmark(simulation_variants)
         if include_automations is None:
             include_automations = (
                 previous_manifest["identity"].get("include_automations", True)
@@ -103,6 +134,18 @@ def evaluate_history(
             )
         if not isinstance(include_automations, bool):
             raise TypeError("include_automations must be boolean")
+        if replayable_suite is None:
+            replayable_suite = (
+                previous_manifest["identity"].get("suite_policy", "legacy-catalogue-v1")
+                != "legacy-catalogue-v1"
+                if previous_manifest and resume and not refreshing
+                else True
+            )
+        if not isinstance(replayable_suite, bool):
+            raise TypeError("replayable_suite must be boolean")
+        if simulation_variants is not None and not replayable_suite:
+            raise ValueError("Simulation variants require replayable suite preparation")
+        suite_policy = SUITE_VERSION if replayable_suite else "legacy-catalogue-v1"
         identity = {
             "configuration": configuration,
             "compiler": compiler_config,
@@ -110,6 +153,10 @@ def evaluate_history(
             "curator": curator_config,
             "days": days,
             "include_automations": include_automations,
+            "suite_policy": suite_policy,
+            "variants_hash": canonical_hash(simulation_variants)
+            if simulation_variants is not None
+            else None,
             "source": source,
             "roots": [str(Path(p).expanduser().resolve()) for p in roots] if roots else None,
             "exclude": [str(Path(p).expanduser().resolve()) for p in exclude or []],
@@ -126,6 +173,8 @@ def evaluate_history(
             # frozen scope; refresh explicitly introduces the current curation stage.
             manifest["identity"].setdefault("include_automations", True)
             manifest["identity"].setdefault("curator", curator_config)
+            manifest["identity"].setdefault("suite_policy", "legacy-catalogue-v1")
+            manifest["identity"].setdefault("variants_hash", None)
             if manifest["identity"] != identity:
                 old_settings = {
                     key: value
@@ -136,10 +185,12 @@ def evaluate_history(
                     key: value for key, value in identity.items() if key != "preparation_identity"
                 }
                 roles = {"compiler", "curator"}
-                old_scope = {k: v for k, v in old_settings.items() if k not in roles}
-                new_scope = {k: v for k, v in new_settings.items() if k not in roles}
+                policy_keys = {"suite_policy", "variants_hash"}
+                ignored = roles | (policy_keys if refreshing else set())
+                old_scope = {k: v for k, v in old_settings.items() if k not in ignored}
+                new_scope = {k: v for k, v in new_settings.items() if k not in ignored}
                 extensions = []
-                budget_increase = refresh_preparation and old_scope == new_scope
+                budget_increase = refreshing and old_scope == new_scope
                 for role in sorted(roles):
                     old_role = dict(old_settings[role])
                     new_role = dict(new_settings[role])
@@ -159,8 +210,15 @@ def evaluate_history(
                     raise ValueError("Cannot resume with changed configuration or scope")
                 if budget_increase:
                     manifest.setdefault("preparation_budget_changes", []).extend(extensions)
+                    changes = {
+                        key: {"before": old_settings.get(key), "after": new_settings.get(key)}
+                        for key in policy_keys
+                        if old_settings.get(key) != new_settings.get(key)
+                    }
+                    if changes:
+                        manifest.setdefault("suite_policy_changes", []).append(changes)
                 if (
-                    refresh_preparation
+                    refreshing
                     or not (output / manifest.get("benchmark_path", "benchmark.json")).exists()
                 ):
                     manifest["identity"] = identity
@@ -178,6 +236,9 @@ def evaluate_history(
                 "stage": "discovery",
             }
             write_json(manifest_path, manifest)
+        if simulation_variants is not None:
+            # Write only after accepting the full frozen scope/configuration identity.
+            write_json(variants_path, simulation_variants)
         inventory_path = output / "inventory.json"
         if inventory_path.exists():
             inventory = read_json(inventory_path)
@@ -362,6 +423,37 @@ def evaluate_history(
             manifest["preparation_elapsed_seconds"] = (
                 previous_elapsed + time.monotonic() - preparation_started
             )
+            catalogue_hash = canonical_hash(benchmark)
+            catalogue_path = output / f"catalogue-{catalogue_hash}.json"
+            if catalogue_path.is_symlink():
+                raise ValueError("Content-addressed catalogue cannot follow symbolic links")
+            if catalogue_path.exists():
+                if read_json(catalogue_path) != benchmark:
+                    raise ValueError("Content-addressed catalogue changed unexpectedly")
+            else:
+                write_json(catalogue_path, benchmark)
+            manifest.update(
+                catalogue_path=catalogue_path.name,
+                catalogue_hash=catalogue_hash,
+                catalogue_readiness=dict(
+                    Counter(task.get("readiness", "ready") for task in benchmark["tasks"])
+                ),
+            )
+            if replayable_suite:
+                try:
+                    benchmark = build_replayable_suite(benchmark, simulation_variants)
+                except ValueError as exc:
+                    manifest.update(
+                        stage="preparation_incomplete",
+                        suite_error=str(exc),
+                        goal_readiness={},
+                        source_status=dict(Counter(row["status"] for row in inventory["sessions"])),
+                    )
+                    write_json(preparation_path, {"calls": list(calls)})
+                    write_json(inventory_path, inventory)
+                    write_json(manifest_path, manifest)
+                    return {"workflow": manifest, "report": None}
+            manifest.pop("suite_error", None)
             new_hash = canonical_hash(benchmark)
             if (
                 refresh_preparation
@@ -401,6 +493,10 @@ def evaluate_history(
             write_json(preparation_path, {"calls": list(calls)})
         else:
             benchmark = read_json(benchmark_path)
+            manifest.setdefault(
+                "catalogue_readiness",
+                dict(Counter(task.get("readiness", "ready") for task in benchmark["tasks"])),
+            )
         manifest.update(stage="evaluation", benchmark_hash=canonical_hash(benchmark))
         write_json(manifest_path, manifest)
         report_path = run_directory / "report.json"
@@ -454,6 +550,7 @@ def evaluate_history(
             workers=workers,
             progress=progress,
             resume=resume and report_path.exists(),
+            refresh_assessments=refresh_assessments,
             allow_unsafe_local=allow_unsafe_local,
             max_total_seconds=max_total_seconds,
             stop_after_cost_usd=stop_after_cost_usd,

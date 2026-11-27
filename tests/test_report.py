@@ -16,6 +16,36 @@ class TagParser(HTMLParser):
 
 
 class ReportTests(unittest.TestCase):
+    def test_assessment_refresh_is_distinguished_from_new_candidate_execution(self):
+        rendered = render_report(
+            {"assessment_revisions": [{"source_snapshot": "<script>bad</script>"}]}
+        )
+        self.assertIn("No replacement candidate answers were generated", rendered)
+        self.assertNotIn("<script>", rendered)
+
+    def test_simulation_provenance_and_trusted_state_are_visible(self):
+        result = render_report(
+            {
+                "suite": {
+                    "total_tasks": 98,
+                    "origin_counts": {"frozen_original": 34, "simulated": 1},
+                },
+                "trials": [
+                    {
+                        "task_id": "mock",
+                        "environment": {
+                            "kind": "calendar-mail-v1",
+                            "final_state": {"note": "<script>untrusted</script>"},
+                        },
+                    }
+                ],
+            }
+        )
+        self.assertIn("35 runnable tasks from a catalogue of 98", result)
+        self.assertIn("Simulated account changes do not change live accounts", result)
+        self.assertIn("Simulated environment: initial state, final state, tool operations", result)
+        self.assertNotIn("<script>", result)
+
     def test_replay_coverage_distinguishes_completed_ready_goals_from_declared_gaps(self):
         result = render_report(
             {

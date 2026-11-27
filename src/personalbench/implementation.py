@@ -13,7 +13,8 @@ from .schema import canonical_hash
 
 def implementation_sources() -> dict[str, bytes]:
     return {
-        name: (Path(__file__).parent / name).read_bytes() for name in ("grading.py", "scoring.py")
+        name: (Path(__file__).parent / name).read_bytes()
+        for name in ("grading.py", "scoring.py", "environment_grading.py")
     }
 
 

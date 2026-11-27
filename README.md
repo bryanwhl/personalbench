@@ -44,7 +44,7 @@ personalbench evaluate --config /path/to/candidate.json \
 
 This single command discovers Codex and Claude sessions, freezes the 120-day window, recovers read-only historical inputs, compiles independent goals, runs fresh attempts, and writes `.personalbench/history/run/report.html`. The compiler and judge default to the candidate's explicitly selected model with tools disabled; use `--compiler`, `--curator`, and `--judge` for separate configurations. The curator defaults to the compiler model and runs with tools disabled. Codex workspace attempts use a named filesystem profile that grants minimal runtime reads and the supplied workspace, with network access disabled. Native execution still requires trusted tasks.
 
-Preparation and execution each default to three workers and a 30-minute batch budget. Change them with `--preparation-workers`, `--workers`, `--max-preparation-seconds`, and `--max-total-seconds`. Stop and continue the same evaluation with the same command plus `--resume`; completed compilation and candidate attempts are retained. An interrupted output assessment can be retried without rerunning the candidate. Changing model configuration or scope requires a new output directory. Plain resume retains the original window and automation scope even when current defaults differ. Native adapter and input-boundary identities are recorded; preparation refresh starts fresh when the previous adapter differs, and comparisons reject different input boundaries. After fixing preparation, add `--resume --refresh-preparation` to revalidate the frozen inputs and cached goal compilation; changed benchmarks and runs receive a new revision while prior reports stay intact. Completed outcomes are reused only when the full task inputs, requirements, candidate setup, and grading context are unchanged; failures are retained as well as successes. Newly ready or changed goals receive new attempts.
+Preparation and execution each default to three workers and a 30-minute batch budget. Change them with `--preparation-workers`, `--workers`, `--max-preparation-seconds`, and `--max-total-seconds`. Stop and continue the same evaluation with the same command plus `--resume`; completed compilation and candidate attempts are retained. An interrupted output assessment can be retried without rerunning the candidate. After a grader implementation fix, `--resume --refresh-assessments` explicitly reassesses all saved completed attempts under one new grading policy, preserving a snapshot of prior grades and all candidate measurements. It requires unchanged candidate setup, task data, judge configuration, and score aggregation; it never generates replacement candidate answers. Changing model configuration or scope requires a new output directory. Plain resume retains the original window and automation scope even when current defaults differ. Native adapter and input-boundary identities are recorded; preparation refresh starts fresh when the previous adapter differs, and comparisons reject different input boundaries. After fixing preparation, add `--resume --refresh-preparation` to revalidate the frozen inputs and cached goal compilation; changed benchmarks and runs receive a new revision while prior reports stay intact. Completed outcomes are reused only when the full task inputs, requirements, candidate setup, and grading context are unchanged; failures are retained as well as successes. Newly ready or changed goals receive new attempts.
 
 `--days`, `--as-of`, `--source`, repeatable `--session-root`, and repeatable `--exclude-session` override the default. `--exclude-session-id` excludes a chat and its descendants. The current Codex chat and internal agent threads are excluded automatically. Compressed `.jsonl.zst` logs use the optional `zstd` executable with decoded size and time limits. Later activity in a resumed chat does not exclude earlier eligible work: compiler messages and tool evidence are frozen at the cutoff.
 
@@ -53,6 +53,36 @@ Every user request is mapped to a goal or an explicit preparation exclusion. Gen
 The candidate receives only the prepared brief and preserved inputs. The compiler receives normalized messages and a source catalog; the judge receives criteria, preserved inputs, and the candidate's answer. Personal artifacts remain local; configured model providers receive that selected content. Raw logs, frozen sources, compilation records, criteria, native tool traces, execution evidence, and the report stay in the private output directory. Candidate coverage contains sufficiency information rather than original-log locators; private provenance retains the full audit. No collector or automatic publication is installed.
 
 For preparation without execution, use `personalbench build --compiler /path/to/compiler.json --output .personalbench/benchmark.json --allow-unsafe-local`. `build` without a session uses the same 120-day corpus; without a compiler it produces an explicitly labeled draft. `sessions` lists the source inventory without printing conversation contents. Review unknown evidence and category coverage when interpreting a score; a graded subset is not a whole-history score.
+
+## Replayable suites and simulated services
+
+The history catalogue and the runnable benchmark are separate artifacts. `evaluate` preserves the full curated catalogue in an immutable `catalogue-<hash>.json`, then executes a suite containing only ready cases. `workflow.json` records both paths and both coverage counts. A suite score is not a claim that every catalogue task was evaluated. Plain legacy resume preserves its prior scope; an explicit preparation refresh introduces the current suite policy.
+
+A live-account requirement is often an environment gap, not a reason to abandon a task. The first stateful backend provides an isolated mailbox and calendar. Each attempt starts from a frozen fixture and can search/read mail and list/create/update/delete calendar events through MCP tools. It changes real simulator state, rather than returning canned success strings. No live account, credentials, or network access is needed. Captured initial/final state and operations are saved with the attempt.
+
+```bash
+personalbench run examples/calendar-benchmark.json \
+  --config examples/calendar-codex.json --output .personalbench/calendar \
+  --allow-unsafe-local
+```
+
+The example is explicitly synthetic and uses a real configured model. Choose an accessible model ID in the configuration. `tools: "environment"` exposes only the simulated service; `tools: "workspace"` can also use the preserved filesystem. The first backend currently supports the Codex harness.
+
+Critical `environment_state` criteria check actual calendar outcomes: correct event fields and times, no unexpected additions, and preservation of unrelated events. Expected answers stay outside the candidate and tool server. Changing an initial event is authorized only when the criterion explicitly targets its ID; a new-event goal cannot pass by overwriting another meeting. A fluent claim of success cannot replace a missing mutation. The isolated rubric judge also receives captured environment evidence and bounded native tool records, including failed commands and API calls, so retrieval and action claims can be verified.
+
+The current calendar-action adaptation requires a critical state-outcome criterion and no unresolved live-account, publication, UI, or training capability. Adding an empty environment or a contains("done") check cannot make an unsupported task runnable.
+
+Simulation variants are explicit new case packages with `provenance.adapted_from`, the exact original task hash, and an adaptation explanation. Fixtures declare `fixture_origin: "historical"` or `"synthetic"`. A historically seeded simulation may cover only the captured scenario, not an entire former account. Preserve missing or ambiguous facts rather than inventing confirmation. A synthetic fixture is a declared adaptation, not recovered historical evidence.
+
+```bash
+personalbench suite /path/to/catalogue.json \
+  --variants /path/to/simulation-variants.json --output .personalbench/suite.json
+personalbench evaluate --config /path/to/candidate.json \
+  --variants /path/to/simulation-variants.json \
+  --output .personalbench/history --allow-unsafe-local
+```
+
+A suite retains one case per source family and records included originals, substitutions, and excluded backlog tasks. Supplied variants are frozen and verified on resume. To withdraw them, use `--resume --refresh-preparation --clear-variants`; plain resume never silently drops fixtures. Missing source files still require recovery or a disclosed reconstruction. A stubbed training job cannot establish actual model quality; a publication simulator measures workflow behavior, not a real deployment.
 
 ## Make a benchmark from a selected session
 

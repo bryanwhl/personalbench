@@ -911,3 +911,406 @@ class ParallelEngineTests(unittest.TestCase):
             self.assertEqual(final["run_status"], "complete")
             self.assertEqual(final["summary"]["success_pct"], 100)
             self.assertEqual([row["cost_usd"] for row in final["judge_calls"]], [0.1, 0.2])
+
+
+class AssessmentRefreshTests(unittest.TestCase):
+    def setUp(self):
+        from personalbench.implementation import implementation_sources
+
+        self.sources = implementation_sources()
+        self.updated = {
+            **self.sources,
+            "grading.py": self.sources["grading.py"]
+            + b"\n# Synthetic assessment-evidence context revision\n",
+        }
+        self.bench = benchmark(("a", "b"))
+        for task in self.bench["tasks"]:
+            task["brief"] = f"Return done for {task['id']}"
+            task["criteria"][0]["kind"] = "judge"
+        self.config = fixture(("a", "b"))
+        self.judge = fixture()
+
+    def callback(self, *, revised=False, interrupt=False, observed=None):
+        def callback(config, *, calls, **kwargs):
+            def judge(prompt):
+                payload = json.loads(prompt.split("\n", 1)[1])
+                identifier = payload["task_brief"].rsplit(" ", 1)[-1]
+                if observed is not None:
+                    observed.append(identifier)
+                calls.append({"status": "completed", "cost_usd": 0.2 if revised else 0.1})
+                if interrupt and identifier == "b":
+                    raise KeyboardInterrupt
+                score = 1 if revised or identifier == "a" else 0
+                return json.dumps(
+                    {
+                        "scores": [
+                            {
+                                "id": "check",
+                                "score": score,
+                                "evidence": "New captured evidence" if revised else "Old context",
+                            }
+                        ]
+                    }
+                )
+
+            return judge
+
+        return callback
+
+    def original(self, output, *, benchmark_value=None, **kwargs):
+        with (
+            patch("personalbench.engine.implementation_sources", return_value=self.sources),
+            patch("personalbench.engine.model_callback", side_effect=self.callback()),
+        ):
+            return evaluate(
+                benchmark_value or self.bench,
+                self.config,
+                output,
+                judge_config=self.judge,
+                allow_unsafe_local=True,
+                **kwargs,
+            )
+
+    def test_reassesses_all_completed_outcomes_without_candidate_calls_and_keeps_backup(self):
+        from personalbench.grading import grade
+        from personalbench.schema import canonical_hash
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "run"
+            original = self.original(output)
+            old_bytes = (output / "report.json").read_bytes()
+            self.assertEqual(original["summary"]["success_pct"], 50)
+            observed = []
+            with (
+                patch("personalbench.engine.implementation_sources", return_value=self.updated),
+                patch(
+                    "personalbench.engine.model_callback",
+                    side_effect=self.callback(revised=True, observed=observed),
+                ),
+                patch(
+                    "personalbench.engine.run_candidate",
+                    side_effect=AssertionError("Candidate reran"),
+                ),
+                patch("personalbench.engine.grade", wraps=grade) as graded,
+            ):
+                refreshed = evaluate(
+                    self.bench,
+                    self.config,
+                    output,
+                    judge_config=self.judge,
+                    allow_unsafe_local=True,
+                    resume=True,
+                    refresh_assessments=True,
+                )
+                self.assertEqual(graded.call_count, 2)
+            self.assertEqual(observed, ["a", "b"])
+            self.assertEqual(refreshed["summary"]["success_pct"], 100)
+            self.assertEqual(
+                [row["cost_usd"] for row in refreshed["judge_calls"]], [0.1, 0.2, 0.1, 0.2]
+            )
+            self.assertEqual(
+                [row["output"] for row in refreshed["trials"]],
+                [row["output"] for row in original["trials"]],
+            )
+            self.assertEqual(refreshed["scoring_hash"], canonical_hash(refreshed["scoring_policy"]))
+            revision = refreshed["assessment_revisions"][0]
+            self.assertEqual(revision["previous_scoring_hash"], original["scoring_hash"])
+            self.assertEqual(revision["current_scoring_hash"], refreshed["scoring_hash"])
+            self.assertEqual(Path(revision["source_snapshot"]).read_bytes(), old_bytes)
+            self.assertFalse(json.loads(old_bytes)["trials"][1]["grading"]["success"])
+            self.assertNotIn("assessment_refresh_pending", refreshed)
+            with (
+                patch("personalbench.engine.implementation_sources", return_value=self.updated),
+                patch(
+                    "personalbench.engine.model_callback",
+                    side_effect=AssertionError("Repeated assessment"),
+                ),
+                patch(
+                    "personalbench.engine.run_candidate",
+                    side_effect=AssertionError("Candidate reran"),
+                ),
+            ):
+                idempotent = evaluate(
+                    self.bench,
+                    self.config,
+                    output,
+                    judge_config=self.judge,
+                    allow_unsafe_local=True,
+                    resume=True,
+                    refresh_assessments=True,
+                )
+            self.assertEqual(idempotent["assessment_revisions"], refreshed["assessment_revisions"])
+            self.assertEqual(idempotent["trials"], refreshed["trials"])
+
+    def test_interrupted_assessment_refresh_resumes_pending_only_without_candidate_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "run"
+            self.original(output)
+            with (
+                patch("personalbench.engine.implementation_sources", return_value=self.updated),
+                patch(
+                    "personalbench.engine.model_callback",
+                    side_effect=self.callback(revised=True, interrupt=True),
+                ),
+                patch(
+                    "personalbench.engine.run_candidate",
+                    side_effect=AssertionError("Candidate reran"),
+                ),
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                evaluate(
+                    self.bench,
+                    self.config,
+                    output,
+                    judge_config=self.judge,
+                    allow_unsafe_local=True,
+                    resume=True,
+                    refresh_assessments=True,
+                )
+            interrupted = json.loads((output / "report.json").read_text())
+            self.assertTrue(interrupted["assessment_refresh_pending"])
+            self.assertNotIn("assessment_refresh_pending", interrupted["trials"][0])
+            self.assertTrue(interrupted["trials"][1]["assessment_refresh_pending"])
+            observed = []
+            with (
+                patch("personalbench.engine.implementation_sources", return_value=self.updated),
+                patch(
+                    "personalbench.engine.model_callback",
+                    side_effect=self.callback(revised=True, observed=observed),
+                ),
+                patch(
+                    "personalbench.engine.run_candidate",
+                    side_effect=AssertionError("Candidate reran"),
+                ),
+            ):
+                resumed = evaluate(
+                    self.bench,
+                    self.config,
+                    output,
+                    judge_config=self.judge,
+                    allow_unsafe_local=True,
+                    resume=True,
+                )
+            self.assertEqual(observed, ["b"])
+            self.assertEqual(resumed["summary"]["success_pct"], 100)
+            self.assertEqual(len(resumed["assessment_revisions"]), 1)
+            self.assertNotIn("assessment_refresh_pending", resumed)
+
+    def test_refresh_rejects_changed_execution_or_scoring_contract_without_modifying_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "run"
+            self.original(output)
+            before = (output / "report.json").read_bytes()
+            changed_bench = copy.deepcopy(self.bench)
+            changed_bench["scoring"] = {"success_threshold": 90}
+            cases = [
+                (changed_bench, self.config, self.judge, {}, self.updated),
+                (self.bench, dict(self.config, model="different"), self.judge, {}, self.updated),
+                (self.bench, self.config, dict(self.judge, model="different"), {}, self.updated),
+                (self.bench, self.config, self.judge, {"workers": 2}, self.updated),
+                (self.bench, self.config, self.judge, {"repeats": 2}, self.updated),
+                (
+                    self.bench,
+                    self.config,
+                    self.judge,
+                    {},
+                    {
+                        **self.updated,
+                        "scoring.py": self.sources["scoring.py"]
+                        + b"\n# changed aggregation source\n",
+                    },
+                ),
+            ]
+            for bench, configuration, judge, kwargs, sources in cases:
+                with (
+                    self.subTest(kwargs=kwargs, model=configuration["model"], judge=judge["model"]),
+                    patch("personalbench.engine.implementation_sources", return_value=sources),
+                    patch(
+                        "personalbench.engine.run_candidate",
+                        side_effect=AssertionError("Candidate reran"),
+                    ),
+                    self.assertRaises(ValueError),
+                ):
+                    evaluate(
+                        bench,
+                        configuration,
+                        output,
+                        judge_config=judge,
+                        allow_unsafe_local=True,
+                        resume=True,
+                        refresh_assessments=True,
+                        **kwargs,
+                    )
+                self.assertEqual((output / "report.json").read_bytes(), before)
+                self.assertFalse((output / "assessment-revisions").exists())
+            with (
+                patch("personalbench.engine.implementation_sources", return_value=self.updated),
+                patch(
+                    "personalbench.engine._version",
+                    return_value={"harness": "fixture", "version": "changed-runtime"},
+                ),
+                self.assertRaises(ValueError),
+            ):
+                evaluate(
+                    self.bench,
+                    self.config,
+                    output,
+                    judge_config=self.judge,
+                    allow_unsafe_local=True,
+                    resume=True,
+                    refresh_assessments=True,
+                )
+            self.assertEqual((output / "report.json").read_bytes(), before)
+
+    def test_refresh_rejects_unexecuted_or_uncaptured_command_and_file_state_atomically(self):
+        for mode in ("unexecuted", "command", "file", "environment"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "run"
+                bench = copy.deepcopy(self.bench)
+                kwargs = {}
+                if mode == "unexecuted":
+                    kwargs["stop_after_cost_usd"] = 0.5
+                elif mode == "command":
+                    bench["tasks"][0]["criteria"] = [
+                        {
+                            "id": "cmd",
+                            "description": "Run hidden behavioral test",
+                            "kind": "command",
+                            "value": [sys.executable, "test.py"],
+                        }
+                    ]
+                elif mode == "file":
+                    bench["tasks"][0]["criteria"] = [
+                        {
+                            "id": "file",
+                            "description": "Captured file content",
+                            "kind": "file_contains",
+                            "target": "missing.txt",
+                            "value": "done",
+                        }
+                    ]
+                elif mode == "environment":
+                    bench["tasks"][0]["environment"] = {
+                        "kind": "calendar-mail-v1",
+                        "fixture_origin": "synthetic",
+                        "now": "2026-11-26T12:00:00Z",
+                        "timezone": "UTC",
+                        "calendars": [{"id": "primary", "events": []}],
+                        "messages": [],
+                    }
+                    bench["tasks"][0]["criteria"] = [
+                        {
+                            "id": "state",
+                            "description": "Captured environment state",
+                            "kind": "environment_state",
+                            "value": {"calendar_id": "primary", "absent_event_ids": ["obsolete"]},
+                        }
+                    ]
+                self.original(output, benchmark_value=bench, **kwargs)
+                before = (output / "report.json").read_bytes()
+                with (
+                    patch("personalbench.engine.implementation_sources", return_value=self.updated),
+                    patch(
+                        "personalbench.engine.run_candidate",
+                        side_effect=AssertionError("Candidate reran"),
+                    ),
+                    self.assertRaises(ValueError),
+                ):
+                    evaluate(
+                        bench,
+                        self.config,
+                        output,
+                        judge_config=self.judge,
+                        allow_unsafe_local=True,
+                        resume=True,
+                        refresh_assessments=True,
+                    )
+                self.assertEqual((output / "report.json").read_bytes(), before)
+                self.assertFalse((output / "assessment-revisions").exists())
+
+    def test_refresh_requires_explicit_resume_and_fresh_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for kwargs in ({}, {"resume": True, "baseline_type": "recorded"}):
+                with (
+                    self.subTest(kwargs=kwargs),
+                    self.assertRaisesRegex(ValueError, "resume of fresh"),
+                ):
+                    evaluate(
+                        self.bench,
+                        self.config,
+                        Path(directory) / "run",
+                        refresh_assessments=True,
+                        **kwargs,
+                    )
+
+    def test_refresh_preserves_terminal_timeout_zero_and_only_reassesses_completed_candidate(self):
+        def timeout(task, configuration, workspace, **kwargs):
+            result = run_candidate(task, configuration, workspace, **kwargs)
+            if task["id"] == "a":
+                result.update(status="budget_exceeded", output="", error="Synthetic timeout")
+            return result
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "run"
+            with patch("personalbench.engine.run_candidate", side_effect=timeout):
+                original = self.original(output)
+            original_timeout = copy.deepcopy(original["trials"][0])
+            observed = []
+            with (
+                patch("personalbench.engine.implementation_sources", return_value=self.updated),
+                patch(
+                    "personalbench.engine.model_callback",
+                    side_effect=self.callback(revised=True, observed=observed),
+                ),
+                patch(
+                    "personalbench.engine.run_candidate",
+                    side_effect=AssertionError("Candidate reran"),
+                ),
+            ):
+                refreshed = evaluate(
+                    self.bench,
+                    self.config,
+                    output,
+                    judge_config=self.judge,
+                    allow_unsafe_local=True,
+                    resume=True,
+                    refresh_assessments=True,
+                )
+            self.assertEqual(observed, ["b"])
+            self.assertEqual(refreshed["trials"][0], original_timeout)
+            self.assertEqual(refreshed["summary"]["success_pct"], 50)
+
+    def test_refresh_rejects_corrupt_saved_policy_or_summary_before_creating_backup(self):
+        for corrupt in ("policy", "summary", "duplicate"):
+            with self.subTest(corrupt=corrupt), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "run"
+                self.original(output)
+                path = output / "report.json"
+                report = json.loads(path.read_text())
+                if corrupt == "policy":
+                    report["scoring_policy"]["policy"] = "tampered"
+                elif corrupt == "summary":
+                    report["summary"]["success_pct"] = 123
+                else:
+                    report["trials"].append(copy.deepcopy(report["trials"][0]))
+                path.write_text(json.dumps(report))
+                before = path.read_bytes()
+                with (
+                    patch("personalbench.engine.implementation_sources", return_value=self.updated),
+                    patch(
+                        "personalbench.engine.run_candidate",
+                        side_effect=AssertionError("Candidate reran"),
+                    ),
+                    self.assertRaises(ValueError),
+                ):
+                    evaluate(
+                        self.bench,
+                        self.config,
+                        output,
+                        judge_config=self.judge,
+                        allow_unsafe_local=True,
+                        resume=True,
+                        refresh_assessments=True,
+                    )
+                self.assertEqual(path.read_bytes(), before)
+                self.assertFalse((output / "assessment-revisions").exists())

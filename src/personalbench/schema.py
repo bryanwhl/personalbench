@@ -95,9 +95,19 @@ def validate_benchmark(bench: dict) -> dict:
                 "file_contains",
                 "judge",
                 "command",
+                "environment_state",
             }:
                 raise ValidationError("Unsupported grader kind")
             number(criterion.get("weight", 1), "criterion weight", minimum=0.000001)
+            if criterion["kind"] == "environment_state":
+                from .environment_grading import validate_state_check
+
+                try:
+                    validate_state_check(criterion.get("value"))
+                except (ValueError, TypeError) as exc:
+                    raise ValidationError(str(exc)) from exc
+                if not task.get("environment"):
+                    raise ValidationError("Environment state criteria need a declared environment")
             if criterion["kind"] == "command":
                 command = criterion.get("value")
                 if (
@@ -136,6 +146,19 @@ def validate_benchmark(bench: dict) -> dict:
             raise ValidationError("V1 uses equal task weights")
         if task.get("readiness", "ready") not in {"ready", "incomplete", "unsupported"}:
             raise ValidationError("Invalid task readiness")
+        if "environment" in task:
+            from .environments import validate_environment
+
+            environment = validate_environment(task["environment"])
+            calendar_ids = {calendar["id"] for calendar in environment["calendars"]}
+            for criterion in criteria:
+                if (
+                    criterion["kind"] == "environment_state"
+                    and criterion["value"].get("calendar_id", "primary") not in calendar_ids
+                ):
+                    raise ValidationError(
+                        "State criterion refers to a calendar absent from its fixture"
+                    )
     scoring = bench.get("scoring", {})
     if not isinstance(scoring, dict):
         raise ValidationError("scoring must be an object")
@@ -183,8 +206,10 @@ def validate_config(config: dict) -> dict:
     number(config.get("timeout_seconds", 120), "timeout_seconds", minimum=0.1, maximum=86400)
     if config.get("sandbox", "read-only") not in {"read-only", "workspace-write"}:
         raise ValidationError("Only read-only and workspace-write harness policies are supported")
-    if config.get("tools", "none") not in {"none", "workspace"}:
-        raise ValidationError("tools must be none or workspace")
+    if config.get("tools", "none") not in {"none", "workspace", "environment"}:
+        raise ValidationError("tools must be none, workspace or environment")
+    if config.get("tools") == "environment" and config["harness"] != "codex":
+        raise ValidationError("Stateful environment tools currently require the Codex harness")
     if "prices" in config:
         if not isinstance(config["prices"], dict):
             raise ValidationError("prices must be an object")
